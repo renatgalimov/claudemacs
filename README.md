@@ -458,6 +458,13 @@ Configure which AI coding tools are available:
 
 ;; Whether to prefer projectile root over git root when available (default: nil)
 (setq claudemacs-prefer-projectile-root t)
+
+;; Whether to reflect the tool's terminal title in its buffer name, e.g.
+;; "*claude:Fix Router Access*" (default: t). See "Buffer Naming" above.
+(setq claudemacs-show-terminal-title nil)
+
+;; Maximum length of the title shown in the buffer name (default: 40)
+(setq claudemacs-title-max-length 60)
 ```
 
 ```elisp
@@ -533,17 +540,14 @@ Claudemacs provides a startup hook that runs after a session has finished initia
 
 ## Buffer Naming
 
-Claudemacs creates workspace-aware buffer names that include the tool name:
-- With workspace: `*claudemacs:claude:workspace-name*`
-- Without workspace: `*claudemacs:claude:/path/to/project*`
-- Multiple instances: `*claudemacs:claude-2:workspace-name*`
+Claudemacs buffers are named after the tool and, once running, the task the tool reports working on:
+- First instance: `*claude*`, `*codex*`, `*gemini*`
+- Additional instances in the same workspace: `*claude-2*`, `*codex-2*`
+- After the tool sets a terminal title (Claude Code, Codex): `*claude:Fix Router Access*`, `*codex-2:Perform shopping list analys…*`
 
-The format is `*claudemacs:TOOL(-N):SESSION-ID*` where:
-- `TOOL` is the tool name (claude, codex, gemini, etc.)
-- `-N` is the instance number (omitted for first instance)
-- `SESSION-ID` is the workspace name or project path
+Session identity (workspace, instance number) is tracked internally rather than encoded in the name, so the name stays free to reflect the tool's live title. Set `claudemacs-show-terminal-title` to `nil` to keep the plain `*TOOL(-N)*` name for the life of the session, and `claudemacs-title-max-length` (default 40) to control how much of the title is shown.
 
-Currently supports Doom Emacs workspaces and Perspective mode. Open an issue if you use another workspace package.
+Workspace-aware sessions (separate `*claude*` buffers per project) currently support Doom Emacs workspaces and Perspective mode. Open an issue if you use another workspace package.
 
 ## Tips and Tricks
 
