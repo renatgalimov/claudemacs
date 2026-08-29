@@ -34,13 +34,19 @@ CWD is the working directory for the session (defaults to default-directory).
 Returns the created buffer. Caller responsible for cleanup."
   (let* ((session-buffer-name (claudemacs--get-buffer-name))
          (session-buffer (get-buffer-create session-buffer-name))
-         (fake-process (start-process "fake-claude" nil "sleep" "60")))
+         (fake-process (start-process "fake-claude" nil "sleep" "60"))
+         ;; Computed in the caller's directory context so it matches
+         ;; whatever `claudemacs--session-id' the caller resolves later
+         (workspace-session-id (claudemacs--session-id)))
 
     (with-current-buffer session-buffer
       ;; Create fake eat-terminal - must be non-nil to pass validation
       (setq-local eat-terminal 'fake-terminal)
       ;; Set the working directory for file context
-      (setq-local claudemacs--cwd (or cwd default-directory)))
+      (setq-local claudemacs--cwd (or cwd default-directory))
+      (setq-local claudemacs--tool claudemacs-default-tool)
+      (setq-local claudemacs--instance-number 1)
+      (setq-local claudemacs--workspace-session-id workspace-session-id))
     
     ;; Define eat-term-parameter if it doesn't exist, or override if it does
     (setq claudemacs-test--fake-process fake-process)
@@ -188,7 +194,7 @@ This test should FAIL initially, then we make it pass."
   ;; Step 2: Check that buffer name generation works
   (let ((buffer-name (claudemacs--get-buffer-name)))
     (should buffer-name)
-    (should (string-match-p "\\*claudemacs:" buffer-name)))
+    (should (string-match-p "\\`\\*[a-z]+\\*\\'" buffer-name)))
   
   ;; Step 3: Check that project root detection works
   (let ((project-root (claudemacs--project-root)))

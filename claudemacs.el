@@ -262,6 +262,25 @@ When empty string, no sound is played."
   :type 'string
   :group 'claudemacs)
 
+(defcustom claudemacs-show-terminal-title t
+  "Whether to reflect the AI tool's terminal title in its buffer name.
+AI tools such as Claude Code and Codex set their terminal's title to a
+short description of the current task via OSC escape sequences.  When
+non-nil, the session's buffer is renamed to include that title (e.g.
+\"*claude:Fix Router Access*\"), which is visible in `switch-to-buffer',
+the tab bar, and buffer-list front ends such as Helm.
+When nil, the buffer keeps its plain `*TOOL*'/`*TOOL-N*' name for the
+life of the session."
+  :type 'boolean
+  :group 'claudemacs)
+
+(defcustom claudemacs-title-max-length 40
+  "Maximum length of an AI tool's terminal title shown in its buffer name.
+Titles longer than this are truncated with an ellipsis.  See
+`claudemacs-show-terminal-title'."
+  :type 'integer
+  :group 'claudemacs)
+
 (defcustom claudemacs-startup-hook nil
   "Hook run after a claudemacs session has finished starting up.
 This hook is called after the eat terminal is initialized, keymaps
@@ -286,6 +305,14 @@ are executed with the claudemacs buffer as the current buffer."
 
 (defvar-local claudemacs--tool nil
   "Buffer-local variable storing the AI tool name (symbol) for this session.")
+
+(defvar-local claudemacs--instance-number nil
+  "Buffer-local variable storing the 1-based instance number for this session.")
+
+(defvar-local claudemacs--workspace-session-id nil
+  "Buffer-local variable storing the workspace or project-root identifier
+this session belongs to, as returned by `claudemacs--session-id' at
+creation time.")
 
 (defvar-local claudemacs--claude-session-uuid nil
   "Buffer-local variable storing the Claude Code session UUID.
@@ -482,18 +509,12 @@ use its name, otherwise fall back to the project root."
   "Get a list of instance numbers currently in use for TOOL in current workspace.
 Returns a sorted list of integers (e.g., (1 2 3) if claude, claude-2, claude-3 exist)."
   (let ((session-id (claudemacs--session-id))
-        (tool-str (symbol-name tool))
         (numbers '()))
     (dolist (buf (buffer-list))
-      (when (claudemacs--is-claudemacs-buffer-p buf)
-        (let ((buf-name (buffer-name buf)))
-          ;; Match both "tool:session" and "tool-N:session" patterns
-          (when (string-match (format "^\\*claudemacs:%s\\(-\\([0-9]+\\)\\)?:%s\\*$"
-                                      (regexp-quote tool-str)
-                                      (regexp-quote session-id))
-                              buf-name)
-            (let ((num-str (match-string 2 buf-name)))
-              (push (if num-str (string-to-number num-str) 1) numbers))))))
+      (when (and (claudemacs--is-claudemacs-buffer-p buf)
+                 (eq (buffer-local-value 'claudemacs--tool buf) tool)
+                 (equal (buffer-local-value 'claudemacs--workspace-session-id buf) session-id))
+        (push (buffer-local-value 'claudemacs--instance-number buf) numbers)))
     (sort numbers #'<)))
 
 (defun claudemacs--get-next-instance-number (tool)
@@ -515,25 +536,45 @@ Returns 'tool' for instance 1, 'tool-N' for N > 1."
       (symbol-name tool)
     (format "%s-%d" tool instance-num)))
 
+(defun claudemacs--build-buffer-name (tool instance title)
+  "Format TOOL, INSTANCE, and TITLE into a claudemacs buffer name.
+TITLE may be nil, in which case only the tool/instance portion
+(as produced by `claudemacs--format-tool-instance-name') is used.
+Format: *TOOL[-N]* or *TOOL[-N]:TITLE*"
+  (let ((tool-instance (claudemacs--format-tool-instance-name tool instance)))
+    (if title
+        (format "*%s:%s*" tool-instance title)
+      (format "*%s*" tool-instance))))
+
+(defun claudemacs--buffer-name-title (buffer-name)
+  "Return the title portion of BUFFER-NAME, or nil if it has none.
+BUFFER-NAME has the form `*TOOL[-N]*' or `*TOOL[-N]:TITLE*'."
+  (when (string-match "\\`\\*[a-z]+\\(?:-[0-9]+\\)?:\\(.+\\)\\*\\'" buffer-name)
+    (match-string 1 buffer-name)))
+
 (defun claudemacs--get-buffer-name-for-instance (tool instance-num)
   "Generate buffer name for TOOL at INSTANCE-NUM.
-Format: *claudemacs:TOOL:SESSION-ID* or *claudemacs:TOOL-N:SESSION-ID*"
-  (let ((instance-name (claudemacs--format-tool-instance-name tool instance-num)))
-    (format "*claudemacs:%s:%s*" instance-name (claudemacs--session-id))))
+Format: *TOOL* or *TOOL-N*"
+  (claudemacs--build-buffer-name tool instance-num nil))
 
 (defun claudemacs--get-buffer-name (&optional tool)
-  "Generate the claudemacs buffer name based on TOOL and workspace session ID.
+  "Generate the claudemacs buffer name based on TOOL, instance 1.
 TOOL defaults to `claudemacs-default-tool' if not specified.
-Format: *claudemacs:TOOL:SESSION-ID*
+Format: *TOOL*
 Note: This returns the name for the first instance. Use
 `claudemacs--get-buffer-name-for-instance' for specific instances."
-  (let ((tool-name (or tool claudemacs-default-tool)))
-    (format "*claudemacs:%s:%s*" tool-name (claudemacs--session-id))))
+  (claudemacs--build-buffer-name (or tool claudemacs-default-tool) 1 nil))
 
 (defun claudemacs--get-buffer (&optional tool)
-  "Return existing claudemacs buffer for current session and TOOL.
+  "Return existing claudemacs buffer for current session and TOOL, instance 1.
 TOOL defaults to `claudemacs-default-tool' if not specified."
-  (get-buffer (claudemacs--get-buffer-name tool)))
+  (let ((tool-name (or tool claudemacs-default-tool)))
+    (plist-get
+     (seq-find (lambda (session-info)
+                 (and (eq (plist-get session-info :tool) tool-name)
+                      (= (plist-get session-info :instance) 1)))
+               (claudemacs--list-sessions-for-workspace))
+     :buffer)))
 
 (defun claudemacs--get-current-session-buffer ()
   "Return the most relevant claudemacs buffer for the current context.
@@ -558,7 +599,8 @@ Priority:
   "Return t if BUFFER (or current buffer) is a claudemacs buffer."
   (let ((buf (or buffer (current-buffer))))
     (and (buffer-live-p buf)
-         (string-match-p "^\\*claudemacs:" (buffer-name buf)))))
+         (buffer-local-value 'claudemacs--tool buf)
+         t)))
 
 (defun claudemacs--switch-to-buffer (&optional tool)
   "Switch to the claudemacs buffer for current session and TOOL.
@@ -568,10 +610,10 @@ Returns t if switched successfully, nil if no buffer exists."
       (progn
         (with-current-buffer buffer
           (if (not eat-terminal)
-              (error "Claudemacs session exists but no eat-terminal found. Please kill *claudemacs:...* buffer and re-start")
+              (error "Claudemacs session exists but no eat-terminal found. Please kill the session buffer and re-start")
             (let ((process (eat-term-parameter eat-terminal 'eat--process)))
               (if (not (and process (process-live-p process)))
-                (error "Claudemacs session exists but process is not running. Please kill *claudemacs:...* buffer and re-start")))))
+                (error "Claudemacs session exists but process is not running. Please kill the session buffer and re-start")))))
         ;; we have a running eat-terminal
         (display-buffer buffer)
         (select-window (get-buffer-window buffer))
@@ -590,26 +632,19 @@ Each element is a buffer object."
 (defun claudemacs--get-session-info (buffer)
   "Extract session information from BUFFER.
 Returns a plist with :tool, :instance, :session-id, :buffer, :buffer-name,
-and :claude-uuid (the Claude Code session UUID, if tracked).
+:title, and :claude-uuid (the Claude Code session UUID, if tracked).
 The :tool is the base tool symbol (e.g., claude even for claude-2).
 The :instance is the instance number (1 for claude, 2 for claude-2, etc.).
 Returns nil if the buffer is not a claudemacs buffer."
   (when (claudemacs--is-claudemacs-buffer-p buffer)
     (let ((buf-name (buffer-name buffer)))
-      ;; Buffer name format: *claudemacs:TOOL:SESSION-ID* or *claudemacs:TOOL-N:SESSION-ID*
-      (when (string-match "^\\*claudemacs:\\([^-:]+\\)\\(?:-\\([0-9]+\\)\\)?:\\(.+\\)\\*$" buf-name)
-        (let* ((tool-str (match-string 1 buf-name))
-               (instance-str (match-string 2 buf-name))
-               (session-id (match-string 3 buf-name))
-               (instance (if instance-str (string-to-number instance-str) 1))
-               (claude-uuid (when (buffer-live-p buffer)
-                              (buffer-local-value 'claudemacs--claude-session-uuid buffer))))
-          (list :tool (intern tool-str)
-                :instance instance
-                :session-id session-id
-                :buffer buffer
-                :buffer-name buf-name
-                :claude-uuid claude-uuid))))))
+      (list :tool (buffer-local-value 'claudemacs--tool buffer)
+            :instance (buffer-local-value 'claudemacs--instance-number buffer)
+            :session-id (buffer-local-value 'claudemacs--workspace-session-id buffer)
+            :buffer buffer
+            :buffer-name buf-name
+            :title (claudemacs--buffer-name-title buf-name)
+            :claude-uuid (buffer-local-value 'claudemacs--claude-session-uuid buffer)))))
 
 (defun claudemacs--list-sessions-for-workspace ()
   "Return a list of all active sessions in the current workspace.
@@ -868,6 +903,7 @@ Retries using RETRY-COUNT up to 10 times if eat is not ready yet."
           (with-current-buffer buffer
             (claudemacs--setup-buffer-keymap)
             (claudemacs-setup-bell-handler)
+            (claudemacs-setup-title-tracking)
             (claudemacs--disable-codex-cursor-blink)
             ;; Force terminal to adopt actual window dimensions.
             ;; eat-make runs before display-buffer, so the terminal starts
@@ -892,6 +928,47 @@ Use this if system notifications aren't working after starting a session."
       (setf (eat-term-parameter eat-terminal 'ring-bell-function)
             #'claudemacs--bell-handler)
       (message "Bell handler configured for claudemacs session"))))
+
+;;;; Title Tracking
+
+(defun claudemacs--sanitize-title (title)
+  "Flatten TITLE to one line, trim it, and cap it to `claudemacs-title-max-length'.
+Collapses runs of control characters (newlines, tabs) to a single space.
+Returns nil when TITLE is empty or entirely whitespace."
+  (let* ((flattened (replace-regexp-in-string "[[:cntrl:]]+" " " title))
+         (trimmed (string-trim flattened)))
+    (cond
+     ((string-empty-p trimmed) nil)
+     ((<= (length trimmed) claudemacs-title-max-length) trimmed)
+     (t (concat (substring trimmed 0 (1- claudemacs-title-max-length)) "…")))))
+
+(defun claudemacs--rename-buffer-for-title (terminal title)
+  "Rename the current buffer to reflect TITLE.
+Installed as eat's `set-title-function', called whenever the AI tool
+sets its terminal title via an OSC 0/2 escape sequence.  See
+`claudemacs-show-terminal-title'."
+  (ignore terminal)
+  (condition-case error
+      (when (and claudemacs-show-terminal-title claudemacs--tool)
+        (let ((new-name (claudemacs--build-buffer-name
+                          claudemacs--tool
+                          claudemacs--instance-number
+                          (claudemacs--sanitize-title title))))
+          (unless (string= new-name (buffer-name))
+            (rename-buffer new-name t))))
+    (error (message "Claudemacs could not rename buffer for title %S: %s" title error))))
+
+;;;###autoload
+(defun claudemacs-setup-title-tracking ()
+  "Set up or re-setup terminal title tracking for the current session.
+Use this if the buffer name isn't updating with the tool's title after
+starting a session.  See `claudemacs-show-terminal-title'."
+  (interactive)
+  (with-current-buffer (claudemacs--get-current-session-buffer)
+    (when (boundp 'eat-terminal)
+      (setf (eat-term-parameter eat-terminal 'set-title-function)
+            #'claudemacs--rename-buffer-for-title)
+      (message "Title tracking configured for claudemacs session"))))
 
 (defun claudemacs--setup-repl-faces ()
   "Setup faces for the Claude REPL buffer.
@@ -1054,6 +1131,8 @@ The tool configuration is looked up in `claudemacs-tool-registry'."
       ;; Set buffer-local variables after eat-make to ensure they persist
       (setq-local claudemacs--cwd work-dir)
       (setq-local claudemacs--tool tool-name)
+      (setq-local claudemacs--instance-number instance)
+      (setq-local claudemacs--workspace-session-id (claudemacs--session-id))
       (setq-local claudemacs--claude-session-uuid session-uuid)
 
       (claudemacs--setup-repl-faces)
@@ -1300,11 +1379,7 @@ a raw string, working reliably across different CLI tools."
   "Send MESSAGE to BUFFER's eat terminal.
 If NO-RETURN is non-nil, don't send a return/newline."
   (with-current-buffer buffer
-    (let* ((resolved-tool (or tool
-                              claudemacs--tool
-                              (when (string-match "^\\*claudemacs:\\([^:]+\\):" (buffer-name buffer))
-                                (intern (match-string 1 (buffer-name buffer))))
-                              'claude))
+    (let* ((resolved-tool (or tool claudemacs--tool 'claude))
            (plain-message (substring-no-properties message)))
       (if (and (eq resolved-tool 'codex)
                (fboundp 'eat-term-send-string-as-yank))

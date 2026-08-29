@@ -47,8 +47,19 @@ The file is automatically cleaned up after BODY executes."
 (defun claudemacs-test-cleanup-buffers ()
   "Clean up any claudemacs test buffers."
   (dolist (buffer (buffer-list))
-    (when (string-match-p "^\\*claudemacs:.*test\\*" (buffer-name buffer))
+    (when (claudemacs--is-claudemacs-buffer-p buffer)
       (kill-buffer buffer))))
+
+(defun claudemacs-test-make-session-buffer (tool instance session-id &optional title claude-uuid)
+  "Create a fake claudemacs session buffer for TOOL, INSTANCE, and SESSION-ID.
+TITLE and CLAUDE-UUID are optional and set the matching buffer-locals."
+  (let ((buffer (get-buffer-create (claudemacs--build-buffer-name tool instance title))))
+    (with-current-buffer buffer
+      (setq-local claudemacs--tool tool)
+      (setq-local claudemacs--instance-number instance)
+      (setq-local claudemacs--workspace-session-id session-id)
+      (setq-local claudemacs--claude-session-uuid claude-uuid))
+    buffer))
 
 ;;; Project Root Detection Tests
 
@@ -372,15 +383,15 @@ The file is automatically cleaned up after BODY executes."
   (claudemacs-test-with-temp-buffer
     ;; Test non-claudemacs buffer
     (should-not (claudemacs--is-claudemacs-buffer-p))
-    
+
     ;; Test claudemacs buffer
-    (rename-buffer "*claudemacs:test*")
+    (setq-local claudemacs--tool 'claude)
     (should (claudemacs--is-claudemacs-buffer-p))
-    
+
     ;; Test with specific buffer argument
     (with-temp-buffer
       (should-not (claudemacs--is-claudemacs-buffer-p (current-buffer)))
-      (rename-buffer "*claudemacs:another*")
+      (setq-local claudemacs--tool 'codex)
       (should (claudemacs--is-claudemacs-buffer-p (current-buffer)))))
   
   ;; Test with non-live buffer
@@ -432,8 +443,10 @@ The file is automatically cleaned up after BODY executes."
                 (when (claudemacs--is-claudemacs-buffer-p)
                   (setq hook-called-in-claudemacs-buffer t))))
     
-    ;; Mock the bell handler setup to avoid session ID dependency
+    ;; Mock the bell handler and title tracking setup to avoid session ID dependency
     (cl-letf (((symbol-function 'claudemacs-setup-bell-handler)
+               (lambda () nil))
+              ((symbol-function 'claudemacs-setup-title-tracking)
                (lambda () nil)))
       
       (unwind-protect
@@ -442,7 +455,8 @@ The file is automatically cleaned up after BODY executes."
             (setq test-buffer (get-buffer-create "*claudemacs:test-hook*"))
             (with-current-buffer test-buffer
               ;; Set up minimal fake eat-terminal
-              (setq-local eat-terminal 'fake-terminal))
+              (setq-local eat-terminal 'fake-terminal)
+              (setq-local claudemacs--tool 'claude))
             
             ;; Call the setup function directly
             (claudemacs--setup-eat-integration test-buffer)
@@ -471,8 +485,10 @@ The file is automatically cleaned up after BODY executes."
     (add-hook 'claudemacs-startup-hook (lambda () (setq hook1-called t)))
     (add-hook 'claudemacs-startup-hook (lambda () (setq hook2-called t)))
     
-    ;; Mock the bell handler setup to avoid session ID dependency
+    ;; Mock the bell handler and title tracking setup to avoid session ID dependency
     (cl-letf (((symbol-function 'claudemacs-setup-bell-handler)
+               (lambda () nil))
+              ((symbol-function 'claudemacs-setup-title-tracking)
                (lambda () nil)))
       
       (unwind-protect
@@ -481,7 +497,8 @@ The file is automatically cleaned up after BODY executes."
             (setq test-buffer (get-buffer-create "*claudemacs:test-multiple*"))
             (with-current-buffer test-buffer
               ;; Set up minimal fake eat-terminal
-              (setq-local eat-terminal 'fake-terminal))
+              (setq-local eat-terminal 'fake-terminal)
+              (setq-local claudemacs--tool 'claude))
             
             ;; Call the setup function directly
             (claudemacs--setup-eat-integration test-buffer)
@@ -509,8 +526,10 @@ The file is automatically cleaned up after BODY executes."
                 (setq captured-buffer-name (buffer-name))
                 (setq captured-cwd claudemacs--cwd)))
     
-    ;; Mock the bell handler setup to avoid session ID dependency
+    ;; Mock the bell handler and title tracking setup to avoid session ID dependency
     (cl-letf (((symbol-function 'claudemacs-setup-bell-handler)
+               (lambda () nil))
+              ((symbol-function 'claudemacs-setup-title-tracking)
                (lambda () nil)))
       
       (unwind-protect
@@ -520,6 +539,7 @@ The file is automatically cleaned up after BODY executes."
             (with-current-buffer test-buffer
               ;; Set up minimal fake environment
               (setq-local eat-terminal 'fake-terminal)
+              (setq-local claudemacs--tool 'claude)
               (setq-local claudemacs--cwd "/test/directory"))
             
             ;; Call the setup function directly
@@ -696,17 +716,9 @@ The file is automatically cleaned up after BODY executes."
   "Test buffer naming includes tool name."
   :tags '(:unit :multi-tool)
   (let ((claudemacs-default-tool 'claude))
-    ;; Test with default tool
-    (let ((buf-name (claudemacs--get-buffer-name)))
-      (should (string-match-p "^\\*claudemacs:claude:" buf-name)))
-
-    ;; Test with explicit tool
-    (let ((buf-name (claudemacs--get-buffer-name 'codex)))
-      (should (string-match-p "^\\*claudemacs:codex:" buf-name)))
-
-    ;; Test with another tool
-    (let ((buf-name (claudemacs--get-buffer-name 'gemini)))
-      (should (string-match-p "^\\*claudemacs:gemini:" buf-name)))))
+    (should (string= (claudemacs--get-buffer-name) "*claude*"))
+    (should (string= (claudemacs--get-buffer-name 'codex) "*codex*"))
+    (should (string= (claudemacs--get-buffer-name 'gemini) "*gemini*"))))
 
 (ert-deftest claudemacs-test-format-session-choices ()
   "Test formatting session choices for display."
@@ -726,8 +738,8 @@ The file is automatically cleaned up after BODY executes."
   (unwind-protect
       (progn
         ;; Create multiple session buffers
-        (get-buffer-create "*claudemacs:claude:workspace1*")
-        (get-buffer-create "*claudemacs:codex:workspace2*")
+        (claudemacs-test-make-session-buffer 'claude 1 "workspace1")
+        (claudemacs-test-make-session-buffer 'codex 1 "workspace2")
         (get-buffer-create "*not-a-claudemacs-buffer*")
 
         (let ((all-sessions (claudemacs--list-all-sessions)))
@@ -736,10 +748,7 @@ The file is automatically cleaned up after BODY executes."
           ;; Should not include non-claudemacs buffer
           (should-not (member (get-buffer "*not-a-claudemacs-buffer*") all-sessions))))
     ;; Cleanup
-    (when (get-buffer "*claudemacs:claude:workspace1*")
-      (kill-buffer "*claudemacs:claude:workspace1*"))
-    (when (get-buffer "*claudemacs:codex:workspace2*")
-      (kill-buffer "*claudemacs:codex:workspace2*"))
+    (claudemacs-test-cleanup-buffers)
     (when (get-buffer "*not-a-claudemacs-buffer*")
       (kill-buffer "*not-a-claudemacs-buffer*"))))
 
@@ -753,9 +762,9 @@ The file is automatically cleaned up after BODY executes."
         ;; Mock session ID to return "workspace1"
         (cl-letf (((symbol-function 'claudemacs--session-id) (lambda () "workspace1")))
           ;; Create sessions in different workspaces
-          (get-buffer-create "*claudemacs:claude:workspace1*")
-          (get-buffer-create "*claudemacs:codex:workspace1*")
-          (get-buffer-create "*claudemacs:gemini:workspace2*")
+          (claudemacs-test-make-session-buffer 'claude 1 "workspace1")
+          (claudemacs-test-make-session-buffer 'codex 1 "workspace1")
+          (claudemacs-test-make-session-buffer 'gemini 1 "workspace2")
 
           (let ((workspace-sessions (claudemacs--list-sessions-for-workspace)))
             ;; Should only find sessions in workspace1
@@ -765,11 +774,7 @@ The file is automatically cleaned up after BODY executes."
             (should (member 'codex (mapcar (lambda (s) (plist-get s :tool)) workspace-sessions)))
             (should-not (member 'gemini (mapcar (lambda (s) (plist-get s :tool)) workspace-sessions))))))
     ;; Cleanup
-    (dolist (buf '("*claudemacs:claude:workspace1*"
-                   "*claudemacs:codex:workspace1*"
-                   "*claudemacs:gemini:workspace2*"))
-      (when (get-buffer buf)
-        (kill-buffer buf)))))
+    (claudemacs-test-cleanup-buffers)))
 
 (ert-deftest claudemacs-test-list-sessions-sorted-by-recency ()
   "Test that sessions are sorted by most recently accessed."
@@ -782,9 +787,9 @@ The file is automatically cleaned up after BODY executes."
         ;; Mock session ID to return "test"
         (cl-letf (((symbol-function 'claudemacs--session-id) (lambda () "test")))
           ;; Create three sessions
-          (let ((buf-claude (get-buffer-create "*claudemacs:claude:test*"))
-                (buf-codex (get-buffer-create "*claudemacs:codex:test*"))
-                (buf-gemini (get-buffer-create "*claudemacs:gemini:test*")))
+          (let ((buf-claude (claudemacs-test-make-session-buffer 'claude 1 "test"))
+                (buf-codex (claudemacs-test-make-session-buffer 'codex 1 "test"))
+                (buf-gemini (claudemacs-test-make-session-buffer 'gemini 1 "test")))
 
             ;; Set different buffer-display-time values (most recent has highest value)
             ;; Use time-add to create different timestamps
@@ -803,17 +808,13 @@ The file is automatically cleaned up after BODY executes."
               (should (eq (plist-get (nth 1 sessions) :tool) 'gemini))
               (should (eq (plist-get (nth 2 sessions) :tool) 'claude))))))
     ;; Cleanup
-    (dolist (buf '("*claudemacs:claude:test*"
-                   "*claudemacs:codex:test*"
-                   "*claudemacs:gemini:test*"))
-      (when (get-buffer buf)
-        (kill-buffer buf)))))
+    (claudemacs-test-cleanup-buffers)))
 
 (ert-deftest claudemacs-test-get-current-session-buffer ()
   "Test getting the most relevant session buffer for current context."
   :tags '(:unit :multi-tool)
   (unwind-protect
-      (let ((test-buf (get-buffer-create "*claudemacs:claude:test*")))
+      (let ((test-buf (claudemacs-test-make-session-buffer 'claude 1 "test")))
         ;; Test 1: When we're in a claudemacs buffer, return it
         (with-current-buffer test-buf
           (should (eq (claudemacs--get-current-session-buffer) test-buf)))
@@ -822,10 +823,9 @@ The file is automatically cleaned up after BODY executes."
         (cl-letf (((symbol-function 'claudemacs--session-id) (lambda () "test")))
           (let ((result (claudemacs--get-current-session-buffer)))
             (should (bufferp result))
-            (should (string-match-p "^\\*claudemacs:" (buffer-name result))))))
+            (should (claudemacs--is-claudemacs-buffer-p result)))))
     ;; Cleanup
-    (when (get-buffer "*claudemacs:claude:test*")
-      (kill-buffer "*claudemacs:claude:test*"))))
+    (claudemacs-test-cleanup-buffers)))
 
 (ert-deftest claudemacs-test-multiple-tools-same-workspace ()
   "Test that multiple tools can run in the same workspace."
@@ -834,8 +834,8 @@ The file is automatically cleaned up after BODY executes."
       (let ((claudemacs-default-tool 'claude))
         (cl-letf (((symbol-function 'claudemacs--session-id) (lambda () "main")))
           ;; Create buffers for different tools in same workspace
-          (let ((claude-buf (get-buffer-create "*claudemacs:claude:main*"))
-                (codex-buf (get-buffer-create "*claudemacs:codex:main*")))
+          (let ((claude-buf (claudemacs-test-make-session-buffer 'claude 1 "main"))
+                (codex-buf (claudemacs-test-make-session-buffer 'codex 1 "main")))
 
             ;; Both buffers should be recognized as claudemacs buffers
             (should (claudemacs--is-claudemacs-buffer-p claude-buf))
@@ -848,9 +848,7 @@ The file is automatically cleaned up after BODY executes."
             ;; Buffer names should be different
             (should-not (string= (buffer-name claude-buf) (buffer-name codex-buf))))))
     ;; Cleanup
-    (dolist (buf '("*claudemacs:claude:main*" "*claudemacs:codex:main*"))
-      (when (get-buffer buf)
-        (kill-buffer buf)))))
+    (claudemacs-test-cleanup-buffers)))
 
 ;;; Description Function Safety Tests
 
@@ -953,9 +951,8 @@ This function is called by the transient menu and must never error."
         ;; Test killing when in a claudemacs buffer
         (cl-letf (((symbol-function 'claudemacs--session-id) (lambda () "test-kill-current"))
                   ((symbol-function 'eat-kill-process) (lambda () nil)))
-          (let ((buf (get-buffer-create "*claudemacs:claude:test-kill-current*")))
+          (let ((buf (claudemacs-test-make-session-buffer 'claude 1 "test-kill-current")))
             (with-current-buffer buf
-              (setq-local claudemacs--tool 'claude)
               (setq-local buffer-display-time (current-time))
               (claudemacs-kill)
               ;; Buffer should be killed
@@ -964,9 +961,8 @@ This function is called by the transient menu and must never error."
         ;; Test killing most recent session when not in claudemacs buffer
         (cl-letf (((symbol-function 'claudemacs--session-id) (lambda () "test-kill-recent"))
                   ((symbol-function 'eat-kill-process) (lambda () nil)))
-          (let ((buf (get-buffer-create "*claudemacs:claude:test-kill-recent*")))
+          (let ((buf (claudemacs-test-make-session-buffer 'claude 1 "test-kill-recent")))
             (with-current-buffer buf
-              (setq-local claudemacs--tool 'claude)
               (setq-local buffer-display-time (current-time)))
             ;; Call from a different buffer
             (with-temp-buffer
@@ -974,10 +970,7 @@ This function is called by the transient menu and must never error."
               ;; Claude buffer should be killed
               (should-not (buffer-live-p buf)))))
     ;; Cleanup
-    (when (get-buffer "*claudemacs:claude:test-kill-current*")
-      (kill-buffer "*claudemacs:claude:test-kill-current*"))
-    (when (get-buffer "*claudemacs:claude:test-kill-recent*")
-      (kill-buffer "*claudemacs:claude:test-kill-recent*"))))
+    (claudemacs-test-cleanup-buffers)))
 
 (ert-deftest claudemacs-test-kill-specific-session-no-sessions ()
   "Test kill-specific-session errors when no sessions exist."
@@ -992,14 +985,12 @@ This function is called by the transient menu and must never error."
   (unwind-protect
       (cl-letf (((symbol-function 'claudemacs--session-id) (lambda () "test-kill-specific"))
                 ((symbol-function 'eat-kill-process) (lambda () nil)))
-        (let ((buf1 (get-buffer-create "*claudemacs:claude:test-kill-specific*"))
-              (buf2 (get-buffer-create "*claudemacs:codex:test-kill-specific*")))
+        (let ((buf1 (claudemacs-test-make-session-buffer 'claude 1 "test-kill-specific"))
+              (buf2 (claudemacs-test-make-session-buffer 'codex 1 "test-kill-specific")))
           ;; Setup buffers with tool info
           (with-current-buffer buf1
-            (setq-local claudemacs--tool 'claude)
             (setq-local buffer-display-time (current-time)))
           (with-current-buffer buf2
-            (setq-local claudemacs--tool 'codex)
             (setq-local buffer-display-time (current-time)))
 
           ;; Mock completing-read to select the codex session
@@ -1015,25 +1006,19 @@ This function is called by the transient menu and must never error."
             ;; Claude buffer should still exist
             (should (buffer-live-p buf1)))))
     ;; Cleanup
-    (when (get-buffer "*claudemacs:claude:test-kill-specific*")
-      (kill-buffer "*claudemacs:claude:test-kill-specific*"))
-    (when (get-buffer "*claudemacs:codex:test-kill-specific*")
-      (kill-buffer "*claudemacs:codex:test-kill-specific*"))))
+    (claudemacs-test-cleanup-buffers)))
 
 (ert-deftest claudemacs-test-kill-handles-multiple-workspaces ()
   "Test that kill operations respect workspace boundaries."
   :tags '(:unit :kill :multi-tool)
   (unwind-protect
-      (let ((workspace-a-session-id "workspace-a")
-            (workspace-b-session-id "workspace-b"))
+      (let ((workspace-a-session-id "workspace-a"))
         ;; Create sessions in different workspaces
-        (let ((buf-a (get-buffer-create "*claudemacs:claude:workspace-a*"))
-              (buf-b (get-buffer-create "*claudemacs:codex:workspace-b*")))
+        (let ((buf-a (claudemacs-test-make-session-buffer 'claude 1 "workspace-a"))
+              (buf-b (claudemacs-test-make-session-buffer 'codex 1 "workspace-b")))
           (with-current-buffer buf-a
-            (setq-local claudemacs--tool 'claude)
             (setq-local buffer-display-time (current-time)))
           (with-current-buffer buf-b
-            (setq-local claudemacs--tool 'codex)
             (setq-local buffer-display-time (current-time)))
 
           ;; Mock session-id to return workspace-a
@@ -1044,10 +1029,7 @@ This function is called by the transient menu and must never error."
             (should-not (buffer-live-p buf-a))
             (should (buffer-live-p buf-b)))))
     ;; Cleanup
-    (when (get-buffer "*claudemacs:claude:workspace-a*")
-      (kill-buffer "*claudemacs:claude:workspace-a*"))
-    (when (get-buffer "*claudemacs:codex:workspace-b*")
-      (kill-buffer "*claudemacs:codex:workspace-b*"))))
+    (claudemacs-test-cleanup-buffers)))
 
 ;;; Branch/Continue Session Tests
 
@@ -1133,6 +1115,113 @@ This function is called by the transient menu and must never error."
                          :created-at 1772661346
                          :rollout-path "/tmp/fake.jsonl")))
       (should (string-match-p "(no message)" (claudemacs--codex-format-session-choice session))))))
+
+;;; Terminal Title Tracking Tests
+
+(ert-deftest claudemacs-test-sanitize-title-trims-whitespace ()
+  "Test that sanitize-title trims leading/trailing whitespace."
+  :tags '(:unit :title)
+  (should (string= (claudemacs--sanitize-title "  Fix Router Access  ")
+                   "Fix Router Access")))
+
+(ert-deftest claudemacs-test-sanitize-title-collapses-control-characters ()
+  "Test that sanitize-title flattens embedded newlines/tabs to one space."
+  :tags '(:unit :title)
+  (should (string= (claudemacs--sanitize-title "Fix\nRouter\tAccess")
+                   "Fix Router Access")))
+
+(ert-deftest claudemacs-test-sanitize-title-returns-nil-for-blank-title ()
+  "Test that sanitize-title returns nil for an empty or whitespace-only title."
+  :tags '(:unit :title)
+  (should-not (claudemacs--sanitize-title ""))
+  (should-not (claudemacs--sanitize-title "   ")))
+
+(ert-deftest claudemacs-test-sanitize-title-truncates-long-title ()
+  "Test that sanitize-title truncates titles past `claudemacs-title-max-length'."
+  :tags '(:unit :title)
+  (let ((claudemacs-title-max-length 10))
+    (should (string= (claudemacs--sanitize-title "Perform shopping list analysis")
+                     "Perform s…"))))
+
+(ert-deftest claudemacs-test-sanitize-title-keeps-leading-status-glyph ()
+  "Test that sanitize-title preserves a leading status glyph like ✳ or ⏺."
+  :tags '(:unit :title)
+  (should (string= (claudemacs--sanitize-title "✳ Fix Router Access")
+                   "✳ Fix Router Access")))
+
+(ert-deftest claudemacs-test-build-buffer-name-without-title ()
+  "Test that build-buffer-name omits the title segment when TITLE is nil."
+  :tags '(:unit :title)
+  (should (string= (claudemacs--build-buffer-name 'claude 1 nil) "*claude*"))
+  (should (string= (claudemacs--build-buffer-name 'claude 2 nil) "*claude-2*"))
+  (should (string= (claudemacs--build-buffer-name 'codex 1 nil) "*codex*")))
+
+(ert-deftest claudemacs-test-build-buffer-name-with-title ()
+  "Test that build-buffer-name appends the title segment when TITLE is non-nil."
+  :tags '(:unit :title)
+  (should (string= (claudemacs--build-buffer-name 'claude 1 "Fix Router Access")
+                   "*claude:Fix Router Access*"))
+  (should (string= (claudemacs--build-buffer-name 'codex 2 "Perform shopping list analys…")
+                   "*codex-2:Perform shopping list analys…*")))
+
+(ert-deftest claudemacs-test-buffer-name-title-extracts-title ()
+  "Test that buffer-name-title extracts the title segment, or nil without one."
+  :tags '(:unit :title)
+  (should (string= (claudemacs--buffer-name-title "*claude:Fix Router Access*")
+                   "Fix Router Access"))
+  (should (string= (claudemacs--buffer-name-title "*codex-2:Perform shopping list*")
+                   "Perform shopping list"))
+  (should-not (claudemacs--buffer-name-title "*claude*"))
+  (should-not (claudemacs--buffer-name-title "*claude-2*")))
+
+(ert-deftest claudemacs-test-rename-buffer-for-title-updates-buffer-name ()
+  "Test that rename-buffer-for-title renames the buffer to include the title."
+  :tags '(:unit :title)
+  (let ((claudemacs-show-terminal-title t)
+        (buffer (claudemacs-test-make-session-buffer 'claude 1 "workspace")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (claudemacs--rename-buffer-for-title 'fake-terminal "Fix Router Access")
+          (should (string= (buffer-name buffer) "*claude:Fix Router Access*")))
+      (kill-buffer buffer))))
+
+(ert-deftest claudemacs-test-rename-buffer-for-title-blank-title-uses-plain-name ()
+  "Test that rename-buffer-for-title falls back to the plain name for a blank title."
+  :tags '(:unit :title)
+  (let ((claudemacs-show-terminal-title t)
+        (buffer (claudemacs-test-make-session-buffer 'claude 1 "workspace" "Fix Router Access")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (claudemacs--rename-buffer-for-title 'fake-terminal "   ")
+          (should (string= (buffer-name buffer) "*claude*")))
+      (kill-buffer buffer))))
+
+(ert-deftest claudemacs-test-rename-buffer-for-title-noop-when-disabled ()
+  "Test that rename-buffer-for-title does nothing when the feature is disabled."
+  :tags '(:unit :title)
+  (let ((claudemacs-show-terminal-title nil)
+        (buffer (claudemacs-test-make-session-buffer 'claude 1 "workspace")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (claudemacs--rename-buffer-for-title 'fake-terminal "Fix Router Access")
+          (should (string= (buffer-name buffer) "*claude*")))
+      (kill-buffer buffer))))
+
+(ert-deftest claudemacs-test-rename-buffer-for-title-does-not-propagate-errors ()
+  "Test that an error while renaming is caught rather than escaping the callback.
+The callback runs inside eat's process filter under `inhibit-quit'; an
+uncaught error there would break the terminal."
+  :tags '(:unit :title)
+  (let ((claudemacs-show-terminal-title t)
+        (buffer (claudemacs-test-make-session-buffer 'claude 1 "workspace")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (cl-letf (((symbol-function 'rename-buffer)
+                     (lambda (&rest _) (error "Simulated rename failure"))))
+            (should-not (condition-case nil
+                            (progn (claudemacs--rename-buffer-for-title 'fake-terminal "Fix Router Access") nil)
+                          (error t)))))
+      (kill-buffer buffer))))
 
 (provide 'claudemacs-test)
 ;;; claudemacs-test.el ends here
