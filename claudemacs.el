@@ -949,7 +949,7 @@ sets its terminal title via an OSC 0/2 escape sequence.  See
 `claudemacs-show-terminal-title'."
   (ignore terminal)
   (condition-case error
-      (when (and claudemacs-show-terminal-title claudemacs--tool)
+      (when (and (bound-and-true-p claudemacs-show-terminal-title) claudemacs--tool)
         (let ((new-name (claudemacs--build-buffer-name
                           claudemacs--tool
                           claudemacs--instance-number
