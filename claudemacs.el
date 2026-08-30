@@ -933,14 +933,16 @@ Use this if system notifications aren't working after starting a session."
 
 (defun claudemacs--sanitize-title (title)
   "Flatten TITLE to one line, trim it, and cap it to `claudemacs-title-max-length'.
-Collapses runs of control characters (newlines, tabs) to a single space.
-Returns nil when TITLE is empty or entirely whitespace."
+Collapses runs of control characters (newlines, tabs) to a single space,
+and strips any leading run of non-word characters (spinner glyphs and
+the like).  Returns nil when TITLE is empty or entirely whitespace."
   (let* ((flattened (replace-regexp-in-string "[[:cntrl:]]+" " " title))
-         (trimmed (string-trim flattened)))
+         (trimmed (string-trim flattened))
+         (unglyphed (replace-regexp-in-string "\\`[^[:alnum:]_]+" "" trimmed)))
     (cond
-     ((string-empty-p trimmed) nil)
-     ((<= (length trimmed) claudemacs-title-max-length) trimmed)
-     (t (concat (substring trimmed 0 (1- claudemacs-title-max-length)) "…")))))
+     ((string-empty-p unglyphed) nil)
+     ((<= (length unglyphed) claudemacs-title-max-length) unglyphed)
+     (t (concat (substring unglyphed 0 (1- claudemacs-title-max-length)) "…")))))
 
 (defun claudemacs--rename-buffer-for-title (terminal title)
   "Rename the current buffer to reflect TITLE.

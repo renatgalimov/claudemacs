@@ -1143,11 +1143,13 @@ This function is called by the transient menu and must never error."
     (should (string= (claudemacs--sanitize-title "Perform shopping list analysis")
                      "Perform s…"))))
 
-(ert-deftest claudemacs-test-sanitize-title-keeps-leading-status-glyph ()
-  "Test that sanitize-title preserves a leading status glyph like ✳ or ⏺."
+(ert-deftest claudemacs-test-sanitize-title-strips-leading-status-glyph ()
+  "Test that sanitize-title strips a leading status/spinner glyph like ✳ or ◑."
   :tags '(:unit :title)
   (should (string= (claudemacs--sanitize-title "✳ Fix Router Access")
-                   "✳ Fix Router Access")))
+                   "Fix Router Access"))
+  (should (string= (claudemacs--sanitize-title "◑ migrate-openwrt-rpi-to-xiaomi")
+                   "migrate-openwrt-rpi-to-xiaomi")))
 
 (ert-deftest claudemacs-test-build-buffer-name-without-title ()
   "Test that build-buffer-name omits the title segment when TITLE is nil."
