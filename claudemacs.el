@@ -11,12 +11,21 @@
 ;;; Commentary:
 
 ;; Claudemacs integrates with Claude Code (https://docs.anthropic.com/en/docs/claude-code/overview)
-;; for AI-assisted programming in Emacs using the eat terminal emulator.
+;; for AI-assisted programming in Emacs using a selectable terminal backend.
 ;;
 ;; Inspired by Aidermacs: https://github.com/MatthewZMD/aidermacs and
 ;; claude-code.el: https://github.com/stevemolitor/claude-code.el
 
 ;;; Changelog:
+
+;; Version 0.5.0 (unreleased)
+;; - Selectable Eat and Ghostel terminal backends, with backend ownership
+;;   captured per session so both can coexist; Ghostel is preferred by default
+;;   when its package is available
+;; - Windows is fully supported (thanks ot Ghostel)
+;; - Windows completion alerts use registered, non-modal Notification Center
+;;   toasts with a one-time setup command
+;; - Live session list with authoritative Claude/Codex identities
 
 ;; Version 0.4.0 (2026-07-10)
 ;; - New `claudemacs-branch-session' command for forking the current Claude or
@@ -73,8 +82,33 @@
 (require 'transient)
 (require 'project)
 (require 'vc-git)
-(require 'eat nil 'noerror)
+(require 'claudemacs-terminal)
 (require 'claudemacs-comment)
+(require 'claudemacs-session-list)
+
+(declare-function eat-term-parameter "eat")
+(defvar eat-terminal)
+(defvar ghostel-buffer-name-function)
+
+;; A live Emacs can reload this file over a pre-remediation version.  Remove
+;; the old shutdown callback/state in that case so reloading cannot leave
+;; prompt-bearing persistence behind.  This performs no file I/O and is a
+;; one-time compatibility cleanup, not a new lifecycle hook.
+(dolist (function '(claudemacs--save-session-snapshot-on-exit
+                    claudemacs--write-session-snapshot
+                    claudemacs--read-session-snapshot
+                    claudemacs--snapshot-session-data))
+  (when (fboundp function)
+    (remove-hook 'kill-emacs-hook function)
+    (fmakunbound function)))
+(when (boundp 'claudemacs-session-snapshot-file)
+  (makunbound 'claudemacs-session-snapshot-file))
+
+;; Keep the pre-0.5 command name working for users who have it in a keymap or
+;; transient configuration.  The implementation and autoloaded command live
+;; in the dedicated session-list module.
+(unless (fboundp 'claudemacs-session-overview)
+  (defalias 'claudemacs-session-overview #'claudemacs-session-list))
 
 ;; Declare functions from optional packages
 (declare-function safe-persp-name "perspective")
@@ -85,6 +119,7 @@
 ;; consult: optional, enables live buffer preview in session switching
 (declare-function consult--read "consult")
 (declare-function consult--original-window "consult")
+(declare-function w32-notification-notify "w32fns.c" (&rest params))
 
 ;;;; Customization
 (defgroup claudemacs nil
@@ -96,9 +131,41 @@
   :type 'string
   :group 'claudemacs)
 
+(defcustom claudemacs-terminal-backend
+  (if (locate-library "ghostel") 'ghostel 'eat)
+  "Terminal backend used for newly created Claudemacs sessions.
+Ghostel is the default when its package is available on `load-path'; otherwise
+Eat is used.  A value set through Customize or `setq' takes precedence over
+this detected default.  The selected package is loaded lazily when a session
+starts.  Existing sessions retain the backend with which they were created,
+so sessions using different backends may coexist."
+  :type '(choice (const :tag "Eat" eat)
+                 (const :tag "Ghostel" ghostel))
+  :group 'claudemacs)
+
+(defcustom claudemacs-ghostel-query-before-killing t
+  "Whether Claudemacs Ghostel sessions confirm before killing a live process.
+This value is applied buffer-locally to Claudemacs sessions and does not
+change the setting for unrelated Ghostel buffers.  Values match
+`ghostel-query-before-killing': `t' always confirms, `nil' never confirms,
+and `auto' confirms only while a shell command is running."
+  :type '(choice (const :tag "Always" t)
+                 (const :tag "Never" nil)
+                 (const :tag "While a command is running" auto))
+  :group 'claudemacs)
+
+(defcustom claudemacs-ghostel-submit-delay 0.15
+  "Seconds to wait before submitting programmatically inserted Ghostel input.
+Interactive terminal applications can classify a prompt and an immediately
+following Return as one paste burst, causing Return to insert a newline instead
+of submitting.  This delay makes Return arrive as a separate key event.  Set
+this higher if submission is unreliable on a heavily loaded system."
+  :type 'number
+  :group 'claudemacs)
+
 (defcustom claudemacs-program-switches nil
   "List of command line switches to pass to the Claude program.
-These are passed as SWITCHES parameters to `eat-make`.
+These are passed to the selected terminal backend when starting the program.
 E.g, `\'(\"--verbose\" \"--dangerously-skip-permissions\")'"
   :type '(repeat string)
   :group 'claudemacs)
@@ -157,8 +224,7 @@ If nil, show the buffer but don't switch focus to it."
 If nil (default): RET submits input, M-RET creates new line (standard behavior).
 If non-nil: M-RET submits input, RET creates new line (swapped behavior).
 
-This setting only affects claudemacs buffers and does not impact other
-eat buffers."
+This setting only affects Claudemacs terminal buffers."
   :type 'boolean
   :group 'claudemacs)
 
@@ -225,11 +291,11 @@ When nil, no notification is shown (silent operation)."
 (defcustom claudemacs-codex-notification-switches
   '("--config" "tui.notification_method=\"bel\""
     "--config" "tui.notification_condition=\"always\"")
-  "Command-line switches used to route Codex notifications through Eat.
+  "Command-line switches used to route Codex notifications through the terminal.
 
 Codex can emit TUI notifications as OSC 9 or BEL, and by default only emits
-them when it believes its terminal is unfocused.  Eat handles BEL through its
-`ring-bell-function', but does not expose OSC 9 as a bell event.  These
+them when it believes its terminal is unfocused.  Claudemacs terminal backends
+handle BEL through their notification integration.  These
 switches make Codex emit BEL regardless of its focus state so Claudemacs can
 use the same system notification handler as Claude Code.
 
@@ -281,9 +347,14 @@ Titles longer than this are truncated with an ellipsis.  See
   :type 'integer
   :group 'claudemacs)
 
+(defcustom claudemacs-notification-timeout-windows 5
+  "Seconds before a Windows completion notification expires."
+  :type 'integer
+  :group 'claudemacs)
+
 (defcustom claudemacs-startup-hook nil
   "Hook run after a claudemacs session has finished starting up.
-This hook is called after the eat terminal is initialized, keymaps
+This hook is called after the terminal is initialized, keymaps
 are set up, and bell handlers are configured. The hook functions
 are executed with the claudemacs buffer as the current buffer."
   :type 'hook
@@ -317,7 +388,44 @@ creation time.")
 (defvar-local claudemacs--claude-session-uuid nil
   "Buffer-local variable storing the Claude Code session UUID.
 Set when starting a new Claude session with --session-id.
-Used for branching with --resume <uuid> --fork-session.")
+Used for branching with --resume <uuid> --fork-session.
+
+This variable is retained for compatibility.  New code should use
+`claudemacs--session-id' and `claudemacs--session-id-provenance'.")
+
+;; Declare compatibility aliases before their buffer-local referents so Emacs
+;; propagates local bindings through the aliases correctly.
+(defvaralias 'claudemacs--authoritative-session-id 'claudemacs--session-id)
+(defvaralias 'claudemacs--session-identity 'claudemacs--session-id-provenance)
+
+(defvar-local claudemacs--session-id nil
+  "Authoritative tool-neutral session ID for the current Claudemacs buffer.
+
+The value is nil until Claudemacs passes an authoritative ID to the tool.
+It must never be populated from buffer recency, a matching working directory,
+or an ordering heuristic.")
+
+(defvar-local claudemacs--session-id-provenance 'unknown
+  "Provenance of `claudemacs--session-id'.
+
+The value is one of `exact', `discovered', or `unknown'.  `exact' means that
+Claudemacs generated, explicitly selected, or explicitly passed the ID.
+`discovered' is retained only for compatibility with buffers created by an
+older version; new sessions never use it.  An unknown ID is intentionally not
+associated with any history row.")
+
+(defconst claudemacs--session-id-provenances '(exact discovered unknown)
+  "Accepted values for `claudemacs--session-id-provenance'.")
+
+;; Names used by early session-list revisions remain aliases rather than a
+;; second mutable source of identity.  This also lets the read-only module
+;; consume the live state without knowing which lifecycle spelling introduced
+;; it.
+(defvar-local claudemacs--ghostel-escape-map-active nil
+  "Non-nil when Claudemacs' Ghostel overrides are active in this buffer.")
+
+(defvar-local claudemacs--ghostel-escape-map-alist nil
+  "Buffer-local emulation map alist used for Ghostel key overrides.")
 
 ;;;;
 ;;;; Utility Functions
@@ -356,9 +464,13 @@ Then falls back to `vc-git-root', then to the directory itself."
         ;; First try projectile-project-root if available
         (when (fboundp 'projectile-project-root)
           (condition-case nil
-              (let ((proj-root (projectile-project-root)))
-                (when (and proj-root (file-directory-p proj-root))
-                  proj-root))
+              ;; Projectile consults `default-directory' rather than taking a
+              ;; location argument.  Bind it so an explicit DIRECTORY does
+              ;; not accidentally resolve the caller's current project.
+              (let ((default-directory loc))
+                (let ((proj-root (projectile-project-root)))
+                  (when (and proj-root (file-directory-p proj-root))
+                    proj-root)))
             (error nil)))
         ;; Fall back to .projectile marker file
         (claudemacs--find-projectile-root loc)))
@@ -380,92 +492,199 @@ their own notification mechanisms."
     claudemacs-codex-notification-switches))
 
 (defun claudemacs--get-resume-flag (tool)
-  "Get the resume flag for TOOL.
-Returns '--resume' for claude, 'resume' for codex, '--resume' for others."
+  "Return TOOL's resume token for compatibility with older callers.
+
+This token is not a complete launch command; new lifecycle code must use
+`claudemacs--get-resume-args' so an authoritative ID is always supplied."
   (pcase tool
     ('claude "--resume")
     ('codex "resume")
     (_ "--resume")))
 
-(defun claudemacs--get-branch-args (tool &optional session-uuid)
-  "Get the branch/fork arguments for TOOL.
-When SESSION-UUID is provided, uses tool-specific arguments to branch
-from a specific session.  Without UUID, falls back to tool defaults.
-- claude with UUID: (\"--resume\" UUID \"--fork-session\")
-- claude without UUID: (\"--continue\" \"--fork-session\")
-- codex with UUID: (\"fork\" UUID)
-- codex without UUID: (\"fork\" \"--last\")
-- gemini: (\"--resume\")"
+(defconst claudemacs--safe-session-id-regexp
+  "\\`[A-Za-z0-9_.][A-Za-z0-9_.:-]*\\'"
+  "Regexp for session IDs safe to display and pass as one CLI argument.")
+
+(defun claudemacs--safe-session-id-p (value)
+  "Return non-nil when VALUE is a safe, non-empty session ID token.
+
+The allowlist intentionally accepts canonical UUIDs, Codex thread IDs, and
+the other ASCII identifiers emitted by the history providers while rejecting
+leading hyphens, whitespace, control characters, and display punctuation.
+Keeping this check centralized prevents an untrusted history row or manual
+selection from becoming an option-like or misleading CLI argument."
+  (and (stringp value)
+       (string-match-p claudemacs--safe-session-id-regexp value)))
+
+(defun claudemacs--validate-session-id (value &optional tool)
+  "Return VALUE when it is safe for an explicit session operation.
+
+Signal `user-error' for an empty or unsafe ID.  TOOL is included only in the
+diagnostic; it does not change validation rules."
+  (unless (claudemacs--safe-session-id-p value)
+    (user-error "Invalid%s session ID; expected a non-empty safe token"
+                (if tool (format " %s" (capitalize (symbol-name tool))) "")))
+  value)
+
+(defun claudemacs--get-resume-args (tool session-id)
+  "Return explicit resume arguments for TOOL and SESSION-ID.
+
+The caller must supply an authoritative ID.  In particular, this helper never
+returns Codex's bare `resume' selector or Claude's interactive resume picker."
+  (unless session-id
+    (user-error "No authoritative %s session ID is available"
+                (capitalize (symbol-name tool))))
+  (setq session-id (claudemacs--validate-session-id session-id tool))
   (pcase tool
-    ('claude (if session-uuid
-                 (list "--resume" session-uuid "--fork-session")
-               '("--continue" "--fork-session")))
-    ('codex (if session-uuid
-                (list "fork" session-uuid)
-              '("fork" "--last")))
-    ('gemini '("--resume"))
-    (_ '("--continue"))))
+    ('claude (list "--resume" session-id))
+    ('codex (list "resume" session-id))
+    (_ (list "--resume" session-id))))
 
-(defun claudemacs--codex-discover-sessions (cwd)
-  "Query Codex SQLite database for sessions matching CWD.
-Returns a list of plists with :id, :created-at, :rollout-path,
-sorted by created_at descending (most recent first).
-Returns nil if sqlite3 is not available or the database doesn't exist."
-  (let ((db-path (expand-file-name "~/.codex/state_5.sqlite")))
-    (when (and (executable-find "sqlite3")
-               (file-exists-p db-path))
+(defun claudemacs--get-branch-args (tool &optional source-id destination-id)
+  "Return explicit branch/fork arguments for TOOL.
+
+SOURCE-ID must identify the authoritative source conversation.  Claude also
+accepts an optional DESTINATION-ID, which Claudemacs generates before launch
+when the installed CLI supports `--session-id' with `--fork-session'.  Codex
+does not expose a destination-ID option, so the new destination remains
+unknown.  Nil is returned when no authoritative source is available; callers
+must not replace it with a bare picker or `--last' selector."
+  (when source-id
+    (setq source-id (claudemacs--validate-session-id source-id tool))
+    (when destination-id
+      (setq destination-id
+            (claudemacs--validate-session-id destination-id tool)))
+    (pcase tool
+      ('claude (append (list "--resume" source-id "--fork-session")
+                       (when destination-id
+                         (list "--session-id" destination-id))))
+      ('codex (list "fork" source-id))
+      ('gemini (list "--resume" source-id))
+      (_ (list "--resume" source-id)))))
+
+(declare-function claudemacs--session-list-history-rows
+                  "claudemacs-session-list" (&optional tool cwd))
+
+(declare-function claudemacs--session-list-claude-history
+                  "claudemacs-session-list" (&optional cwd))
+(declare-function claudemacs--session-list-codex-history
+                  "claudemacs-session-list" (&optional cwd))
+
+(defun claudemacs--call-history-provider (tool cwd)
+  "Call TOOL's session-list history provider for CWD, or return nil.
+
+The unified provider name is retained as a small forward-compatible contract;
+the current module also exposes the two focused provider functions directly.
+Provider exceptions are returned as `(:error MESSAGE)' so callers that need a
+trustworthy snapshot can distinguish them from an empty history."
+  (let ((function
+         (cond
+          ((fboundp 'claudemacs--session-list-history-rows)
+           (lambda () (claudemacs--session-list-history-rows tool cwd)))
+          ((and (eq tool 'claude)
+                (fboundp 'claudemacs--session-list-claude-history))
+           (lambda () (claudemacs--session-list-claude-history cwd)))
+          ((and (eq tool 'codex)
+                (fboundp 'claudemacs--session-list-codex-history))
+           (lambda () (claudemacs--session-list-codex-history cwd))))))
+    (when function
+      (condition-case error-data
+          (funcall function)
+        ;; Preserve provider failures as an explicit wrapper.  A nil result is
+        ;; a valid empty history for the focused providers, so collapsing an
+        ;; exception to nil would make an unavailable provider indistinguishable
+        ;; from an empty explicit-selection source.
+        (error (list :error (error-message-string error-data)))))))
+
+(defun claudemacs--history-rows-for-tool (tool cwd)
+  "Return authoritative history rows for TOOL and CWD.
+
+The session-list module owns storage resolution and schema validation.  This
+small lifecycle adapter intentionally returns nil when the provider is not
+available or reports an error; callers then fail closed rather than inventing
+an ID.  A row may use either `:session-id' (the normalized contract) or `:id'
+for compatibility with provider implementations."
+  (let ((rows (claudemacs--call-history-provider tool cwd)))
+    (cond
+     ;; A provider result is a wrapper only when it explicitly carries the
+     ;; `:rows' or `:error' contract.  Do not mistake a single normalized row
+     ;; plist for that wrapper.
+     ((and (listp rows)
+           (or (memq :rows rows) (memq :error rows)))
+      (unless (plist-get rows :error)
+        (or (plist-get rows :rows) '())))
+     ((listp rows) rows))))
+
+(defun claudemacs--history-row-session-id (row)
+  "Return a safe authoritative ID from normalized history ROW, or nil.
+
+Malformed provider IDs are excluded before they can enter a completion choice
+or become a command-line argument."
+  (let ((id (or (plist-get row :session-id)
+                (plist-get row :id))))
+    (when (claudemacs--safe-session-id-p id)
+      id)))
+
+(defun claudemacs--history-row-cwd (row)
+  "Return normalized CWD from history ROW, or nil."
+  (let ((cwd (plist-get row :cwd)))
+    (when (stringp cwd)
       (condition-case nil
-          (let* ((output (with-output-to-string
-                           (with-current-buffer standard-output
-                             (call-process "sqlite3" nil t nil
-                                           "-separator" "\x1f"
-                                           db-path
-                                           (format "SELECT id, created_at, rollout_path FROM threads WHERE cwd = '%s' AND archived = 0 ORDER BY created_at DESC LIMIT 20;"
-                                                   (replace-regexp-in-string "'" "''" cwd))))))
-                 (lines (split-string (string-trim output) "\n" t)))
-            (mapcar (lambda (line)
-                      (let ((fields (split-string line "\x1f")))
-                        (list :id (nth 0 fields)
-                              :created-at (string-to-number (or (nth 1 fields) "0"))
-                              :rollout-path (nth 2 fields))))
-                    lines))
-        (error nil)))))
+          (file-truename cwd)
+        (error cwd)))))
 
-(defun claudemacs--codex-last-user-prompt (rollout-path)
-  "Extract the most recent user prompt from a Codex session JSONL file.
-ROLLOUT-PATH is the path to the session's JSONL file.
-Returns the prompt text (up to 80 chars) or nil on failure."
-  (when (and rollout-path (file-exists-p rollout-path))
-    (condition-case nil
-        (let* ((output (with-output-to-string
-                         (with-current-buffer standard-output
-                           (call-process-shell-command
-                            (format "grep '\"role\":\"user\"' %s | tail -1"
-                                    (shell-quote-argument rollout-path))
-                            nil t))))
-               (trimmed (string-trim output)))
-          (when (not (string-empty-p trimmed))
-            (let* ((json (json-parse-string trimmed :object-type 'alist))
-                   (payload (alist-get 'payload json))
-                   (content (alist-get 'content payload))
-                   (text (alist-get 'text (aref content 0))))
-              (when (and text (not (string-empty-p text)))
-                (substring text 0 (min (length text) 80))))))
-      (error nil))))
+(defun claudemacs--same-cwd-p (left right)
+  "Return non-nil when LEFT and RIGHT identify the same directory."
+  (and (stringp left) (stringp right)
+       (or (condition-case nil
+               (file-equal-p (file-truename left) (file-truename right))
+             (error nil))
+           ;; `file-equal-p' returns nil rather than signaling when both
+           ;; paths do not exist, which is common in isolated lifecycle
+           ;; tests and during a concurrently removed worktree.
+           (string= (directory-file-name (expand-file-name left))
+                    (directory-file-name (expand-file-name right))))))
 
-(defun claudemacs--codex-format-session-choice (session)
-  "Format a Codex SESSION plist as a `completing-read' choice string.
-Queries the session's JSONL file for the most recent user prompt.
-Format: \"2026-03-04 16:55 -- first few words of prompt...\""
-  (let* ((timestamp (plist-get session :created-at))
-         (time-str (format-time-string "%Y-%m-%d %H:%M" (seconds-to-time timestamp)))
-         (rollout-path (plist-get session :rollout-path))
-         (prompt (claudemacs--codex-last-user-prompt rollout-path))
-         (display (or prompt "(no message)"))
-         (display (if (> (length display) 60)
-                      (concat (substring display 0 57) "...")
-                    display)))
-    (format "%s -- %s" time-str display)))
+(defun claudemacs--history-rows-for-cwd (tool cwd)
+  "Return TOOL history rows whose authoritative CWD is exactly CWD."
+  (seq-filter
+   (lambda (row)
+     (claudemacs--same-cwd-p cwd (claudemacs--history-row-cwd row)))
+   (or (claudemacs--history-rows-for-tool tool cwd) nil)))
+
+(defun claudemacs--select-history-session-id (tool cwd)
+  "Prompt for an authoritative history ID for TOOL in CWD.
+
+Rows are supplied by the session-list module, not by a recency guess.  If a
+provider is unavailable, an explicit ID may still be entered manually; an
+invalid or empty answer is rejected before launch."
+  (let* ((rows (claudemacs--history-rows-for-cwd tool cwd))
+         (choices
+          (mapcar
+           (lambda (row)
+             (let* ((id (claudemacs--history-row-session-id row))
+                    (description (or (plist-get row :description)
+                                      (plist-get row :title)
+                                      ""))
+                    (display-description
+                     (if (and (stringp description)
+                              (> (length description) 80))
+                         (concat (substring description 0 77) "...")
+                       description)))
+               (cons (if (string-empty-p display-description)
+                         id
+                       (format "%s — %s" id display-description))
+                     id)))
+           (seq-filter #'claudemacs--history-row-session-id rows))))
+    (if choices
+        (cdr (assoc (completing-read
+                     (format "Select %s session: " (capitalize (symbol-name tool)))
+                     choices nil t)
+                    choices))
+      (let ((id (read-string
+                 (format "%s session ID (history unavailable): "
+                         (capitalize (symbol-name tool))))))
+        (claudemacs--validate-session-id id tool)))))
 
 (defun claudemacs--get-current-tool-name ()
   "Get the display name (capitalized) of the current session's tool.
@@ -498,17 +717,24 @@ Checks workspace systems in priority order:
       (let ((ws (persp-current-name)))
         (when (valid-ws-p ws) ws))))))
 
-(defun claudemacs--session-id ()
+(defun claudemacs--session-id (&optional directory)
   "Return an identifier for the current Claudemacs session.
-If a workspace is active (checking various workspace packages),
-use its name, otherwise fall back to the project root."
+If a workspace is active (checking various workspace packages), use its name;
+otherwise fall back to the project root containing DIRECTORY.  DIRECTORY is
+used only for the project-root fallback so workspace-name precedence remains
+  unchanged."
   (or (claudemacs--get-workspace-name)
-      (file-truename (claudemacs--project-root))))
+      (file-truename (if directory
+                         (claudemacs--project-root directory)
+                       (claudemacs--project-root)))))
 
-(defun claudemacs--get-instance-numbers-for-tool (tool)
-  "Get a list of instance numbers currently in use for TOOL in current workspace.
-Returns a sorted list of integers (e.g., (1 2 3) if claude, claude-2, claude-3 exist)."
-  (let ((session-id (claudemacs--session-id))
+(defun claudemacs--get-instance-numbers-for-tool (tool &optional directory)
+  "Get instance numbers currently in use for TOOL in the session for DIRECTORY.
+Return a sorted list of integers, such as (1 2 3) when claude, claude-2, and
+claude-3 exist."
+  (let ((session-id (if directory
+                       (claudemacs--session-id directory)
+                     (claudemacs--session-id)))
         (numbers '()))
     (dolist (buf (buffer-list))
       (when (and (claudemacs--is-claudemacs-buffer-p buf)
@@ -517,10 +743,12 @@ Returns a sorted list of integers (e.g., (1 2 3) if claude, claude-2, claude-3 e
         (push (buffer-local-value 'claudemacs--instance-number buf) numbers)))
     (sort numbers #'<)))
 
-(defun claudemacs--get-next-instance-number (tool)
-  "Get the next available instance number for TOOL.
+(defun claudemacs--get-next-instance-number (tool &optional directory)
+  "Get the next available instance number for TOOL in the session for DIRECTORY.
 Returns 1 if no instances exist, or the next sequential number."
-  (let ((used (claudemacs--get-instance-numbers-for-tool tool)))
+  (let ((used (if directory
+                  (claudemacs--get-instance-numbers-for-tool tool directory)
+                (claudemacs--get-instance-numbers-for-tool tool))))
     (if (null used)
         1
       ;; Find first gap or use max+1
@@ -552,28 +780,38 @@ BUFFER-NAME has the form `*TOOL[-N]*' or `*TOOL[-N]:TITLE*'."
   (when (string-match "\\`\\*[a-z]+\\(?:-[0-9]+\\)?:\\(.+\\)\\*\\'" buffer-name)
     (match-string 1 buffer-name)))
 
-(defun claudemacs--get-buffer-name-for-instance (tool instance-num)
+(defun claudemacs--get-buffer-name-for-instance (tool instance-num &optional directory)
   "Generate buffer name for TOOL at INSTANCE-NUM.
-Format: *TOOL* or *TOOL-N*"
+Format: *TOOL* or *TOOL-N*.  DIRECTORY is accepted for API compatibility;
+the workspace is tracked in `claudemacs--workspace-session-id', not the name."
+  (ignore directory)
   (claudemacs--build-buffer-name tool instance-num nil))
 
-(defun claudemacs--get-buffer-name (&optional tool)
+(defun claudemacs--get-buffer-name (&optional tool directory)
   "Generate the claudemacs buffer name based on TOOL, instance 1.
 TOOL defaults to `claudemacs-default-tool' if not specified.
 Format: *TOOL*
 Note: This returns the name for the first instance. Use
-`claudemacs--get-buffer-name-for-instance' for specific instances."
+`claudemacs--get-buffer-name-for-instance' for specific instances.
+DIRECTORY is accepted for API compatibility and does not affect the name."
+  (ignore directory)
   (claudemacs--build-buffer-name (or tool claudemacs-default-tool) 1 nil))
 
-(defun claudemacs--get-buffer (&optional tool)
+(defun claudemacs--get-buffer (&optional tool directory)
   "Return existing claudemacs buffer for current session and TOOL, instance 1.
-TOOL defaults to `claudemacs-default-tool' if not specified."
-  (let ((tool-name (or tool claudemacs-default-tool)))
+TOOL defaults to `claudemacs-default-tool' if not specified.  DIRECTORY is
+used for the project-root fallback in the session ID."
+  (let ((tool-name (or tool claudemacs-default-tool))
+        (session-id (if directory
+                        (claudemacs--session-id directory)
+                      (claudemacs--session-id))))
     (plist-get
      (seq-find (lambda (session-info)
                  (and (eq (plist-get session-info :tool) tool-name)
-                      (= (plist-get session-info :instance) 1)))
-               (claudemacs--list-sessions-for-workspace))
+                      (eql (plist-get session-info :instance) 1)
+                      (equal (plist-get session-info :session-id) session-id)))
+               (delq nil (mapcar #'claudemacs--get-session-info
+                                 (claudemacs--list-all-sessions))))
      :buffer)))
 
 (defun claudemacs--get-current-session-buffer ()
@@ -609,12 +847,11 @@ Returns t if switched successfully, nil if no buffer exists."
   (if-let* ((buffer (claudemacs--get-buffer tool)))
       (progn
         (with-current-buffer buffer
-          (if (not eat-terminal)
-              (error "Claudemacs session exists but no eat-terminal found. Please kill the session buffer and re-start")
-            (let ((process (eat-term-parameter eat-terminal 'eat--process)))
-              (if (not (and process (process-live-p process)))
-                (error "Claudemacs session exists but process is not running. Please kill the session buffer and re-start")))))
-        ;; we have a running eat-terminal
+          (unless (and claudemacs--terminal-backend
+                       (claudemacs--terminal-ready-p))
+            (error "Claudemacs session exists but its terminal is not initialized. Please kill the session buffer and restart"))
+          (unless (claudemacs--terminal-live-p)
+            (error "Claudemacs session exists but its process is not running. Please kill the session buffer and restart")))
         (display-buffer buffer)
         (select-window (get-buffer-window buffer))
         t)
@@ -629,22 +866,88 @@ Returns t if switched successfully, nil if no buffer exists."
 Each element is a buffer object."
   (seq-filter #'claudemacs--is-claudemacs-buffer-p (buffer-list)))
 
+(defun claudemacs--buffer-session-identity (&optional buffer)
+  "Return the authoritative identity plist for BUFFER.
+
+The result contains `:id' and `:provenance'.  The deprecated Claude UUID
+variable is accepted as an exact identity so that buffers created by an older
+loaded version remain usable after `cp/claudemacs-reload'.  No history lookup
+or CWD/recency inference is performed here."
+  (let ((buffer (or buffer (current-buffer))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (let ((id (or claudemacs--session-id
+                      claudemacs--claude-session-uuid))
+              (provenance (if (memq claudemacs--session-id-provenance
+                                    claudemacs--session-id-provenances)
+                              claudemacs--session-id-provenance
+                            'unknown)))
+          (list :id id
+                :provenance (if (and id
+                                     (null claudemacs--session-id)
+                                     claudemacs--claude-session-uuid)
+                                'exact
+                              provenance)))))))
+
+(defun claudemacs--set-session-identity (id provenance &optional force)
+  "Set the current buffer's live identity to ID with PROVENANCE.
+
+PROVENANCE must be `exact', `discovered', or `unknown'.  Once a non-unknown
+identity has been established it is immutable unless FORCE is non-nil.  This
+  prevents a later refresh or a second database observation from remapping a
+  live buffer to another conversation.  FORCE is used only when a buffer is
+  being deliberately reused for a new tool process."
+  ;; Keep every non-nil identity on the same allowlist used by explicit
+  ;; resume/branch selection.  Invalid exact/discovered IDs are downgraded to
+  ;; unknown rather than being exposed to the live-session view.  A nil ID is
+  ;; valid when deliberately resetting a buffer to unknown.
+  (setq id (and (claudemacs--safe-session-id-p id) id))
+  (unless (memq provenance claudemacs--session-id-provenances)
+    (setq provenance 'unknown))
+  (unless id
+    (setq provenance 'unknown))
+  (let ((current (claudemacs--buffer-session-identity)))
+    (when (or force
+              (eq (plist-get current :provenance) 'unknown)
+              (and (equal id (plist-get current :id))
+                   (eq provenance (plist-get current :provenance))))
+      (setq-local claudemacs--session-id (and (stringp id) id)
+                  claudemacs--session-id-provenance provenance)
+      ;; Keep the old Claude-only slot synchronized for callers that still
+      ;; inspect it.  A discovered Codex ID must never appear there.
+      (setq-local claudemacs--claude-session-uuid
+                  (when (and (eq claudemacs--tool 'claude)
+                             (stringp id)
+                             (eq provenance 'exact))
+                    id))))
+  (claudemacs--buffer-session-identity))
+
 (defun claudemacs--get-session-info (buffer)
   "Extract session information from BUFFER.
 Returns a plist with :tool, :instance, :session-id, :buffer, :buffer-name,
-:title, and :claude-uuid (the Claude Code session UUID, if tracked).
+:title, and :claude-uuid (the Claude Code session UUID, if tracked), plus
+:authoritative-session-id and :identity-provenance.
 The :tool is the base tool symbol (e.g., claude even for claude-2).
 The :instance is the instance number (1 for claude, 2 for claude-2, etc.).
 Returns nil if the buffer is not a claudemacs buffer."
   (when (claudemacs--is-claudemacs-buffer-p buffer)
     (let ((buf-name (buffer-name buffer)))
-      (list :tool (buffer-local-value 'claudemacs--tool buffer)
-            :instance (buffer-local-value 'claudemacs--instance-number buffer)
-            :session-id (buffer-local-value 'claudemacs--workspace-session-id buffer)
-            :buffer buffer
-            :buffer-name buf-name
-            :title (claudemacs--buffer-name-title buf-name)
-            :claude-uuid (buffer-local-value 'claudemacs--claude-session-uuid buffer)))))
+      (let* ((tool (buffer-local-value 'claudemacs--tool buffer))
+             (session-id (buffer-local-value 'claudemacs--workspace-session-id buffer))
+             (identity (claudemacs--buffer-session-identity buffer))
+             (claude-uuid (and (eq (plist-get identity :provenance) 'exact)
+                               (eq tool 'claude)
+                               (plist-get identity :id))))
+        (list :tool tool
+              :instance (buffer-local-value 'claudemacs--instance-number buffer)
+              :session-id session-id
+              :workspace session-id
+              :buffer buffer
+              :buffer-name buf-name
+              :title (claudemacs--buffer-name-title buf-name)
+              :claude-uuid claude-uuid
+              :authoritative-session-id (plist-get identity :id)
+              :identity-provenance (plist-get identity :provenance))))))
 
 (defun claudemacs--list-sessions-for-workspace ()
   "Return a list of all active sessions in the current workspace.
@@ -797,31 +1100,118 @@ Returns the session info plist, or nil if there aren't enough sessions."
                       (seq-take errors 2) "; ")))))
 
 ;;;; Terminal Integration
-;; Eat terminal emulator functions
-(declare-function eat-make "eat")
-(declare-function eat-term-send-string "eat")
-(declare-function eat-term-send-string-as-yank "eat")
-(declare-function eat-term-input-event "eat")
-(declare-function eat-kill-process "eat")
-(declare-function eat-term-parameter "eat")
-(declare-function eat-term-cursor-type "eat")
-
-(defvar eat-default-cursor-type)
-(defvar eat-very-visible-cursor-type)
-(defvar eat-vertical-bar-cursor-type)
-(defvar eat-very-visible-vertical-bar-cursor-type)
-(defvar eat-horizontal-bar-cursor-type)
-(defvar eat-very-visible-horizontal-bar-cursor-type)
 
 ;;;; Bell Handling
-(defun claudemacs--bell-handler (terminal)
-  "Handle bell events from an AI tool in TERMINAL.
+(defun claudemacs--bell-handler (&rest _arguments)
+  "Handle a bell event from the current AI tool.
 This function is called when the tool sends a bell character."
-  (ignore terminal)
   (when claudemacs-notify-on-await
     (let ((tool-name (capitalize (symbol-name (or claudemacs--tool claudemacs-default-tool)))))
       (claudemacs--system-notification (format "%s finished and is awaiting your input" tool-name)))))
 
+
+(defun claudemacs--windows-notification-shortcut ()
+  "Return the installed Windows notification shortcut, or nil."
+  (when-let* ((appdata (getenv "APPDATA"))
+              (shortcut
+               (expand-file-name
+                "Microsoft/Windows/Start Menu/Programs/Claudemacs.lnk"
+                appdata))
+              ((file-exists-p shortcut)))
+    shortcut))
+
+(defvar claudemacs--windows-notification-identity-ready nil
+  "Whether this Emacs process refreshed the Windows notification identity.")
+
+(defun claudemacs--windows-notification-script ()
+  "Return the installed Windows notification helper script, or nil."
+  (when-let* ((library (or (symbol-file 'claudemacs--system-notification
+                                        'defun)
+                           (locate-library "claudemacs")))
+              (script (expand-file-name "claudemacs-toast.ps1"
+                                        (file-name-directory library)))
+              ((file-readable-p script)))
+    script))
+
+(defun claudemacs--install-windows-notification-shortcut ()
+  "Install and return the per-user Windows notification shortcut.
+Signal an error if installation fails."
+  (let* ((script (claudemacs--windows-notification-script))
+         (powershell (executable-find "powershell"))
+         (emacs-executable
+          (expand-file-name invocation-name invocation-directory)))
+    (unless (and script (file-readable-p script))
+      (error "Cannot find claudemacs-toast.ps1"))
+    (unless powershell
+      (error "Cannot find Windows PowerShell"))
+    (with-temp-buffer
+      (let ((status (call-process
+                     powershell nil t nil
+                     "-NoProfile" "-ExecutionPolicy" "Bypass"
+                     "-File" script "-Install" "-TargetPath"
+                     emacs-executable)))
+        (unless (zerop status)
+          (error "Windows notification setup failed (status %s): %s"
+                 status (string-trim (buffer-string))))))
+    (or (claudemacs--windows-notification-shortcut)
+        (error "Windows notification shortcut was not created"))))
+
+(defun claudemacs--launch-windows-notification (message title)
+  "Launch the Windows toast helper directly with MESSAGE and TITLE."
+  (let ((script (claudemacs--windows-notification-script))
+        (powershell (executable-find "powershell")))
+    (unless script
+      (error "Cannot find claudemacs-toast.ps1"))
+    (unless powershell
+      (error "Cannot find Windows PowerShell"))
+    (make-process
+     :name "claudemacs-toast"
+     :buffer nil
+     :command (list powershell
+                    "-NoProfile" "-WindowStyle" "Hidden"
+                    "-ExecutionPolicy" "Bypass"
+                    "-File" script
+                    "-Title" title
+                    "-Message" message
+                    "-TimeoutSeconds"
+                    (number-to-string
+                     claudemacs-notification-timeout-windows))
+     :connection-type 'pipe
+     :noquery t)))
+
+(defun claudemacs--fallback-windows-notification (message title)
+  "Show a best-effort Windows notification with MESSAGE and TITLE."
+  (if (fboundp 'w32-notification-notify)
+      (w32-notification-notify :level 'info :title title :body message)
+    (message "%s: %s" title message)))
+
+(defun claudemacs--windows-notification (message title)
+  "Show a non-modal Windows notification with MESSAGE and TITLE."
+  (condition-case error-data
+      (progn
+        ;; Refresh once per Emacs process.  This repairs shortcuts left behind
+        ;; by package upgrades or moves without adding work to every toast.
+        (unless claudemacs--windows-notification-identity-ready
+          (claudemacs--install-windows-notification-shortcut)
+          (setq claudemacs--windows-notification-identity-ready t))
+        (claudemacs--launch-windows-notification message title))
+    (error
+     (display-warning 'claudemacs (error-message-string error-data))
+     (claudemacs--fallback-windows-notification message title))))
+
+;;;###autoload
+(defun claudemacs-setup-windows-notifications ()
+  "Reinstall the per-user identity for Windows toast notifications.
+Claudemacs normally installs this automatically when first needed."
+  (interactive)
+  (unless (eq system-type 'windows-nt)
+    (user-error "This setup command is only needed on Windows"))
+  (condition-case error-data
+      (progn
+        (claudemacs--install-windows-notification-shortcut)
+        (setq claudemacs--windows-notification-identity-ready t)
+        (message "Claudemacs Windows notifications installed"))
+    (error (user-error "%s" (error-message-string error-data)))))
 
 (defun claudemacs--system-notification (message &optional title)
   "Show a system notification with MESSAGE and optional TITLE.
@@ -850,112 +1240,81 @@ This works across macOS, Linux, and Windows platforms."
            (executable-find "kdialog"))
       (call-process "kdialog" nil nil nil "--passivepopup"
                     (format "%s: %s" title message) "3"))
-     ;; Windows with PowerShell
+     ;; Windows taskbar/Notification Center notification.  Unlike a Forms
+     ;; message box, this is non-modal and dismisses itself.
      ((eq system-type 'windows-nt)
-      (call-process "powershell" nil nil nil
-                    "-Command" 
-                    (format "[System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms'); [System.Windows.Forms.MessageBox]::Show('%s', '%s')"
-                            message title)))
+      (claudemacs--windows-notification message title))
      ;; Fallback: show in Emacs message area
      (t (message "%s: %s" title message)))))
 
-(defun claudemacs--force-resize-terminal (buffer)
-  "Force eat terminal in BUFFER to adopt the actual window dimensions.
-Bypasses `window-adjust-process-window-size-function' which may be set
-to `ignore' by the time this runs."
-  (when-let* ((win (get-buffer-window buffer))
-              (width (max (window-body-width win) 1))
-              (height (max (window-body-height win) 1)))
-    (let ((inhibit-read-only t))
-      (eat-term-resize eat-terminal width height)
-      (eat-term-redisplay eat-terminal))))
-
-(defun claudemacs--disable-codex-cursor-blink ()
-  "Disable eat's expensive frame-redrawing cursor blink for Codex.
-Codex requests a blinking terminal cursor.  Eat implements that by
-calling `redraw-frame' twice per second, which can make the entire
-Emacs frame flicker.  Preserve the requested cursor shape while using
-the corresponding non-blinking eat cursor configuration."
-  (when (eq claudemacs--tool 'codex)
-    (setq-local eat-very-visible-cursor-type
-                (copy-tree eat-default-cursor-type))
-    (setq-local eat-very-visible-vertical-bar-cursor-type
-                (copy-tree eat-vertical-bar-cursor-type))
-    (setq-local eat-very-visible-horizontal-bar-cursor-type
-                (copy-tree eat-horizontal-bar-cursor-type))
-    ;; Apply the new mapping to the cursor state Codex already requested.
-    ;; The buffer-local mappings also prevent later cursor-style escape
-    ;; sequences from re-enabling eat's blink timer.
-    (funcall (eat-term-parameter eat-terminal 'set-cursor-function)
-             eat-terminal
-             (eat-term-cursor-type eat-terminal))))
-
-(defun claudemacs--setup-eat-integration (buffer &optional retry-count)
-  "Set up eat integration (keymap and bell handler) for BUFFER.
-Retries using RETRY-COUNT up to 10 times if eat is not ready yet."
+(defun claudemacs--setup-terminal-integration (buffer &optional retry-count)
+  "Set up terminal integration for BUFFER.
+Retries using RETRY-COUNT up to 10 times if the backend is not ready yet."
   (let ((retry-count (or retry-count 0)))
-    (if (and (buffer-live-p buffer)
-             (with-current-buffer buffer
-               (and (boundp 'eat-terminal) eat-terminal)))
-        ;; Eat is ready, set up integration
-        (progn
-          (message "Eat is ready, setting up integrations")
-          (with-current-buffer buffer
-            (claudemacs--setup-buffer-keymap)
-            (claudemacs-setup-bell-handler)
-            (claudemacs-setup-title-tracking)
-            (claudemacs--disable-codex-cursor-blink)
-            ;; Force terminal to adopt actual window dimensions.
-            ;; eat-make runs before display-buffer, so the terminal starts
-            ;; with a default size; send SIGWINCH so the CLI sees the real width.
-            (claudemacs--force-resize-terminal buffer)
-            ;; Run startup hook after setup is complete
-            (run-hooks 'claudemacs-startup-hook)))
-      ;; Eat not ready yet, retry if we haven't exceeded max attempts
-      (when (< retry-count 10)
-        (message "Eat not ready yet, retrying in 0.5s (attempt %d/10)" (1+ retry-count))
-        (run-with-timer 0.5 nil
-                        (lambda ()
-                          (claudemacs--setup-eat-integration buffer (1+ retry-count))))))))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (cond
+         ((and claudemacs--terminal-backend
+               (claudemacs--terminal-ready-p))
+          (message "Claudemacs terminal is ready, setting up integrations")
+          (claudemacs--terminal-setup-faces)
+          (claudemacs--setup-buffer-keymap)
+          (claudemacs-setup-bell-handler)
+          (claudemacs-setup-title-tracking)
+          (run-hooks 'claudemacs-startup-hook))
+         ((< retry-count 10)
+          (message "Claudemacs terminal not ready; retrying in 0.5s (attempt %d/10)"
+                   (1+ retry-count))
+          (run-with-timer 0.5 nil
+                          (lambda ()
+                            (claudemacs--setup-terminal-integration
+                             buffer (1+ retry-count))))))))))
 
 ;;;###autoload
 (defun claudemacs-setup-bell-handler ()
   "Set up or re-setup the completion notification handler.
 Use this if system notifications aren't working after starting a session."
   (interactive)
-  (with-current-buffer (claudemacs--get-current-session-buffer)
-    (when (boundp 'eat-terminal)
-      (setf (eat-term-parameter eat-terminal 'ring-bell-function)
-            #'claudemacs--bell-handler)
-      (message "Bell handler configured for claudemacs session"))))
+  (if-let ((buffer (claudemacs--get-current-session-buffer)))
+      (with-current-buffer buffer
+        (claudemacs--terminal-setup-buffer #'claudemacs--bell-handler)
+        (message "Bell handler configured for Claudemacs session"))
+    (user-error "No Claudemacs session is active")))
 
 ;;;; Title Tracking
 
 (defun claudemacs--sanitize-title (title)
   "Flatten TITLE to one line, trim it, and cap it to `claudemacs-title-max-length'.
 Collapses runs of control characters (newlines, tabs) to a single space.
-Returns nil when TITLE is empty or entirely whitespace."
-  (let* ((flattened (replace-regexp-in-string "[[:cntrl:]]+" " " title))
-         (trimmed (string-trim flattened)))
-    (cond
-     ((string-empty-p trimmed) nil)
-     ((<= (length trimmed) claudemacs-title-max-length) trimmed)
-     (t (concat (substring trimmed 0 (1- claudemacs-title-max-length)) "…")))))
+Returns nil when TITLE is nil, empty, or entirely whitespace."
+  (when title
+    (let* ((flattened (replace-regexp-in-string "[[:cntrl:]]+" " " title))
+           (trimmed (string-trim flattened)))
+      (cond
+       ((string-empty-p trimmed) nil)
+       ((<= (length trimmed) claudemacs-title-max-length) trimmed)
+       (t (concat (substring trimmed 0 (1- claudemacs-title-max-length)) "…"))))))
+
+(defun claudemacs--title-buffer-name (title)
+  "Return the current session's buffer name reflecting TITLE, or nil.
+Returns nil when `claudemacs-show-terminal-title' is nil or the current
+buffer is not a claudemacs session.  Installed directly as Ghostel's
+buffer-local `ghostel-buffer-name-function'."
+  (when (and claudemacs-show-terminal-title claudemacs--tool)
+    (claudemacs--build-buffer-name claudemacs--tool
+                                   claudemacs--instance-number
+                                   (claudemacs--sanitize-title title))))
 
 (defun claudemacs--rename-buffer-for-title (terminal title)
   "Rename the current buffer to reflect TITLE.
-Installed as eat's `set-title-function', called whenever the AI tool
-sets its terminal title via an OSC 0/2 escape sequence.  See
+Installed as eat's `set-title-function' on TERMINAL, called whenever the
+AI tool sets its terminal title via an OSC 0/2 escape sequence.  See
 `claudemacs-show-terminal-title'."
   (ignore terminal)
   (condition-case error
-      (when (and claudemacs-show-terminal-title claudemacs--tool)
-        (let ((new-name (claudemacs--build-buffer-name
-                          claudemacs--tool
-                          claudemacs--instance-number
-                          (claudemacs--sanitize-title title))))
-          (unless (string= new-name (buffer-name))
-            (rename-buffer new-name t))))
+      (when-let* ((new-name (claudemacs--title-buffer-name title)))
+        (unless (string= new-name (buffer-name))
+          (rename-buffer new-name t)))
     (error (message "Claudemacs could not rename buffer for title %S: %s" title error))))
 
 ;;;###autoload
@@ -964,60 +1323,67 @@ sets its terminal title via an OSC 0/2 escape sequence.  See
 Use this if the buffer name isn't updating with the tool's title after
 starting a session.  See `claudemacs-show-terminal-title'."
   (interactive)
-  (with-current-buffer (claudemacs--get-current-session-buffer)
-    (when (boundp 'eat-terminal)
-      (setf (eat-term-parameter eat-terminal 'set-title-function)
-            #'claudemacs--rename-buffer-for-title)
-      (message "Title tracking configured for claudemacs session"))))
-
-(defun claudemacs--setup-repl-faces ()
-  "Setup faces for the Claude REPL buffer.
-Applies consistent styling to all eat-mode terminal faces."
-  
-  ;; Helper function to remap a face to inherit from claudemacs-repl-face
-  (cl-flet ((remap-face (face &rest props)
-              (apply #'face-remap-add-relative face :inherit 'claudemacs-repl-face props)))
-    
-    ;; Set buffer default face
-    (buffer-face-set :inherit 'claudemacs-repl-face)
-    
-    ;; Remap all eat terminal faces to inherit from claudemacs-repl-face
-    (mapc #'remap-face
-          '(eat-shell-prompt-annotation-running
-            eat-shell-prompt-annotation-success
-            eat-shell-prompt-annotation-failure
-            eat-term-bold eat-term-faint eat-term-italic
-            eat-term-slow-blink eat-term-fast-blink))
-    
-    ;; Remap font faces (eat-term-font-0 through eat-term-font-9)
-    (dotimes (i 10)
-      (remap-face (intern (format "eat-term-font-%d" i))))
-    
-    ;; Specific overrides
-    (face-remap-add-relative 'nobreak-space :underline nil)
-    (remap-face 'eat-term-faint :foreground "#999999" :weight 'light)))
+  (if-let* ((buffer (claudemacs--get-current-session-buffer)))
+      (with-current-buffer buffer
+        (pcase claudemacs--terminal-backend
+          ('eat
+           (when (and (boundp 'eat-terminal) eat-terminal)
+             (setf (eat-term-parameter eat-terminal 'set-title-function)
+                   #'claudemacs--rename-buffer-for-title)))
+          ('ghostel
+           (setq-local ghostel-buffer-name-function
+                       #'claudemacs--title-buffer-name)))
+        (message "Title tracking configured for Claudemacs session"))
+    (user-error "No Claudemacs session is active")))
 
 (defun claudemacs--ret-key ()
-  "Send return key event to eat terminal."
+  "Send a return key event to the current terminal."
   (interactive)
-  (eat-term-input-event eat-terminal 1 'return))
+  (claudemacs--terminal-send-key 'return))
 
 (defun claudemacs--meta-ret-key ()
-  "Send meta + return to eat terminal."
+  "Send meta-return to the current terminal."
   (interactive)
-  (eat-term-send-string eat-terminal "\e\C-m"))
-
-(defun claudemacs--maybe-left-key ()
-  "Send left arrow in claudemacs buffers, otherwise default eat-self-input."
-  (interactive)
-  (if (claudemacs--is-claudemacs-buffer-p)
-      (eat-term-input-event eat-terminal 1 'left)
-    (call-interactively #'eat-self-input)))
+  (claudemacs--terminal-send-key 'meta-return))
 
 (defun claudemacs--send-escape ()
-  "Send ESC to eat terminal."
+  "Send ESC to the current terminal."
   (interactive)
-  (eat-term-send-string eat-terminal "\e"))
+  ;; Ghostel sets `quit-flag' before dispatching C-g because it keeps
+  ;; `inhibit-quit' non-nil while routing terminal input.  Clear it so the
+  ;; escape key reaches the selected backend instead of aborting the command.
+  (setq quit-flag nil)
+  (claudemacs--terminal-send-key 'escape))
+
+(defun claudemacs--setup-ghostel-escape-map ()
+  "Keep Claudemacs' Ghostel key overrides ahead of Ghostel's mode maps.
+
+Ghostel replaces its local map whenever it switches input modes.  An
+emulation map remains active across those replacements while staying local to
+this Claudemacs session buffer.  Rebuild the map on every setup so changing
+the return-key options cannot leave stale bindings behind."
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-g") #'claudemacs--send-escape)
+
+    ;; Ghostel accepts both the control-character and named-event forms of
+    ;; return keys.  Bind both forms because the event Emacs reports depends
+    ;; on whether input came from a terminal or a graphical session.
+    (when claudemacs-m-return-is-submit
+      (dolist (key '("RET" "<return>"))
+        (define-key map (kbd key) #'claudemacs--meta-ret-key))
+      (dolist (key '("M-RET" "<M-return>"))
+        (define-key map (kbd key) #'claudemacs--ret-key)))
+    (when claudemacs-shift-return-newline
+      (dolist (key '("S-RET" "<S-return>"))
+        (define-key map (kbd key) #'claudemacs--meta-ret-key)))
+
+    (setq-local claudemacs--ghostel-escape-map-active t)
+    (setq-local claudemacs--ghostel-escape-map-alist
+                `((claudemacs--ghostel-escape-map-active . ,map)))
+    (setq-local emulation-mode-map-alists
+                (cons 'claudemacs--ghostel-escape-map-alist
+                      (delq 'claudemacs--ghostel-escape-map-alist
+                            (copy-sequence emulation-mode-map-alists))))))
 
 ;;;###autoload
 (defun claudemacs-send-yes ()
@@ -1026,7 +1392,7 @@ Applies consistent styling to all eat-mode terminal faces."
   (claudemacs--validate-process)
   (let ((buffer (claudemacs--get-current-session-buffer)))
     (with-current-buffer buffer
-      (claudemacs--send-return-for-tool eat-terminal buffer))))
+      (claudemacs--send-return-for-tool buffer))))
 
 ;;;###autoload
 (defun claudemacs-send-no ()
@@ -1035,21 +1401,25 @@ Applies consistent styling to all eat-mode terminal faces."
   (claudemacs--validate-process)
   (let ((buffer (claudemacs--get-current-session-buffer)))
     (with-current-buffer buffer
-      (eat-term-send-string eat-terminal "\e"))))
+      (claudemacs--terminal-send-key 'escape))))
 
 (defun claudemacs--setup-buffer-keymap ()
   "Set up truly buffer-local keymap for claudemacs buffers with custom key bindings."
   (when (claudemacs--is-claudemacs-buffer-p)
     (message "Setting up buffer-local keymap for claudemacs buffer: %s" (buffer-name))
 
-    ;; Create a new keymap that inherits from the current local map (eat-mode)
+    ;; Inherit the selected terminal mode's local map.
     (let ((map (make-sparse-keymap)))
-      ;; Inherit all eat functionality by setting parent keymap
       (set-keymap-parent map (current-local-map))
 
       ;; Override specific keys for claudemacs functionality
       (define-key map (kbd "C-g") #'claudemacs--send-escape)
-      (message "Defined C-b -> left arrow, C-g -> claudemacs--send-escape")
+      (message "Defined C-g -> claudemacs--send-escape")
+
+      ;; Ghostel replaces its local map when switching input modes, so keep
+      ;; this override in a buffer-local emulation map as well.
+      (when (eq claudemacs--terminal-backend 'ghostel)
+        (claudemacs--setup-ghostel-escape-map))
 
       ;; Handle return key swapping if enabled
       (when claudemacs-m-return-is-submit
@@ -1060,9 +1430,6 @@ Applies consistent styling to all eat-mode terminal faces."
       ;; Handle shift-return newline if enabled
       (when claudemacs-shift-return-newline
         (define-key map (kbd "<S-return>") #'claudemacs--meta-ret-key)
-        ;; alternative key representations that eat might use:
-        ;(define-key map (kbd "S-RET") #'claudemacs--meta-ret-key)
-        ;(define-key map (kbd "<shift-return>") #'claudemacs--meta-ret-key)
         (message "Defined S-RET -> newline"))
 
       ;; Apply the keymap as truly buffer-local
@@ -1074,18 +1441,88 @@ Applies consistent styling to all eat-mode terminal faces."
 Falls back to '/bin/sh' if SHELL environment variable is not set."
   (or (getenv "SHELL") "/bin/sh"))
 
+(defun claudemacs--argument-value (args flag)
+  "Return the string value following FLAG in ARGS, or nil.
+
+The value is intentionally returned before validation so callers can reject
+empty, option-like, or otherwise unsafe IDs rather than silently treating
+them as absent."
+  (when-let ((tail (member flag args)))
+    (let ((value (cadr tail)))
+      (when (stringp value)
+        value))))
+
+(defun claudemacs--identity-plan-for-start (tool args session-uuid)
+  "Return the identity plan implied by TOOL, ARGS, and SESSION-UUID.
+
+The result is a plist with `:provenance' and optional `:id'.  Codex fork/new
+sessions intentionally return `:unknown': the CLI does not expose a
+destination-ID option and no post-start history association is attempted.
+An explicit Codex resume remains exact."
+  (let ((explicit-session-id (claudemacs--argument-value args "--session-id"))
+        (resume-id (claudemacs--argument-value args "--resume"))
+        (codex-resume-id (claudemacs--argument-value args "resume"))
+        (codex-fork-source-id (claudemacs--argument-value args "fork")))
+    ;; Validate values even when they are empty or option-like.  This keeps a
+    ;; malformed explicit flag from reaching the process argv as an implicit
+    ;; picker or another option.
+    (when (member "--session-id" args)
+      (setq explicit-session-id
+            (claudemacs--validate-session-id explicit-session-id tool)))
+    (when (member "--resume" args)
+      (setq resume-id
+            (claudemacs--validate-session-id resume-id tool)))
+    (when (and (eq tool 'codex) (member "fork" args))
+      (setq codex-fork-source-id
+            (claudemacs--validate-session-id codex-fork-source-id tool)))
+    (pcase tool
+      ('claude
+       (cond
+        ((member "--session-id" args)
+         (list :provenance 'exact :id explicit-session-id))
+        ;; A fork without an explicit destination creates a new conversation;
+        ;; the source ID must not be mistaken for that destination.
+        ((and (member "--fork-session" args) (null session-uuid))
+         (list :provenance 'unknown))
+        (session-uuid (list :provenance 'exact :id session-uuid))
+        (resume-id
+         (list :provenance 'exact
+               :id (claudemacs--validate-session-id resume-id tool)))
+        (t (list :provenance 'unknown))))
+      ('codex
+       (cond
+        ((member "resume" args)
+         (list :provenance 'exact
+               :id (claudemacs--validate-session-id
+                    codex-resume-id tool)))
+        (t (list :provenance 'unknown))))
+      (_ (list :provenance 'unknown)))))
+
 (defun claudemacs--start (work-dir &optional tool instance-num &rest args)
   "Start AI coding tool TOOL in WORK-DIR with ARGS.
 TOOL defaults to `claudemacs-default-tool' if not specified.
 INSTANCE-NUM specifies which instance number to use (1, 2, 3, etc.).
 If INSTANCE-NUM is nil, the next available instance number is used.
 The tool configuration is looked up in `claudemacs-tool-registry'."
-  (require 'eat)
   (let* ((tool-name (or tool claudemacs-default-tool))
+         (terminal-backend claudemacs-terminal-backend)
          (tool-config (claudemacs--get-tool-config tool-name))
-         (instance (or instance-num (claudemacs--get-next-instance-number tool-name)))
+         (instance (or instance-num
+                       (claudemacs--get-next-instance-number tool-name work-dir)))
          (default-directory work-dir)
-         (buffer-name (claudemacs--get-buffer-name-for-instance tool-name instance))
+         ;; Generate UUID and validate explicit identity arguments before
+         ;; allocating the session buffer.  Invalid launch IDs must fail
+         ;; without leaving an empty live-session buffer behind.
+         (session-uuid (when (and (eq tool-name 'claude)
+                                  (not (member "--session-id" args))
+                                  (not (member "--resume" args))
+                                  (not (member "--continue" args)))
+                         (claudemacs--generate-uuid)))
+         (identity-plan
+          (claudemacs--identity-plan-for-start
+           tool-name args session-uuid))
+         (buffer-name (claudemacs--get-buffer-name-for-instance
+                       tool-name instance work-dir))
          (buffer (get-buffer-create buffer-name))
          ;; Capture buffer-local and tool-specific values before switching buffers
          (program (or (plist-get tool-config :program) claudemacs-program))
@@ -1095,84 +1532,64 @@ The tool configuration is looked up in `claudemacs-tool-registry'."
                   (plist-get tool-config :switches)))
          (use-shell-env claudemacs-use-shell-env)
          (process-environment
-          (append claudemacs-process-environment process-environment))
-         ;; Generate UUID for new Claude sessions (not resuming/continuing)
-         (session-uuid (when (and (eq tool-name 'claude)
-                                  (not (member "--resume" args))
-                                  (not (member "--continue" args)))
-                         (claudemacs--generate-uuid))))
+          (append claudemacs-process-environment process-environment)))
     ;; Verify program exists before attempting to start
     (unless (or use-shell-env (executable-find program))
       (kill-buffer buffer)
       (error "Program '%s' not found in PATH" program))
 
-    (with-current-buffer buffer
-      (cd work-dir)
-      ;; Sync eat-term-name with TERM from claudemacs-process-environment
-      (when-let ((term-entry (seq-find (lambda (s) (string-prefix-p "TERM=" s))
-                                       claudemacs-process-environment)))
-        (setq-local eat-term-name (substring term-entry 5)))
-      (let* ((process-adaptive-read-buffering nil)
-             (uuid-args (when session-uuid (list "--session-id" session-uuid)))
-             (switches (remove nil (append uuid-args args program-switches))))
-        (condition-case err
-            (if use-shell-env
-                ;; New behavior: Run through shell to source profile (e.g., .zprofile, .bash_profile)
-                (let* ((shell (claudemacs--get-shell-name))
-                       (claude-cmd (format "%s %s" program
-                                           (mapconcat 'shell-quote-argument switches " "))))
-                  (eat-make (substring buffer-name 1 -1) shell nil "-c" claude-cmd))
-              ;; Original behavior: Run Claude directly without shell environment
-              (apply #'eat-make (substring buffer-name 1 -1) program nil switches))
-          (error
-           (kill-buffer buffer)
-           (error "Failed to start %s: %s" program (error-message-string err)))))
+    (condition-case error-data
+        (progn
+          ;; Load before displaying the new buffer so a missing optional package
+          ;; fails without leaving an empty session window behind.
+          (claudemacs--terminal-ensure-backend terminal-backend)
+          (let* ((window (display-buffer buffer))
+                 (process-adaptive-read-buffering nil)
+                 (uuid-args (when session-uuid
+                              (list "--session-id" session-uuid)))
+                 (switches (remove nil
+                                   (append uuid-args args program-switches)))
+                 (start-program program)
+                 (start-switches switches))
+            (when use-shell-env
+              (setq start-program (claudemacs--get-shell-name)
+                    start-switches
+                    (list "-c"
+                          (mapconcat #'shell-quote-argument
+                                     (cons program switches) " "))))
+            (with-current-buffer buffer
+              (cd work-dir)
+              (claudemacs--terminal-start
+               buffer terminal-backend start-program start-switches)
 
-      ;; Set buffer-local variables after eat-make to ensure they persist
-      (setq-local claudemacs--cwd work-dir)
-      (setq-local claudemacs--tool tool-name)
-      (setq-local claudemacs--instance-number instance)
-      (setq-local claudemacs--workspace-session-id (claudemacs--session-id))
-      (setq-local claudemacs--claude-session-uuid session-uuid)
-
-      (claudemacs--setup-repl-faces)
-      ;; Optimize scrolling for terminal input - allows text to go to bottom
-      (setq-local scroll-conservatively 10000)  ; Never recenter
-      (setq-local scroll-margin 0)              ; No margin so text goes to edge
-      (setq-local maximum-scroll-margin 0)      ; No maximum margin
-      (setq-local scroll-preserve-screen-position t)  ; Preserve position during scrolling
-      
-      ;; Additional stabilization for blinking character height changes
-      (setq-local auto-window-vscroll nil)      ; Disable automatic scrolling adjustments
-      (setq-local scroll-step 1)                ; Scroll one line at a time
-      (setq-local hscroll-step 1)               ; Horizontal scroll one column at a time
-      (setq-local hscroll-margin 0)             ; No horizontal scroll margin
-      
-      ;; Force consistent line spacing to prevent height fluctuations
-      (setq-local line-spacing 0)               ; No extra line spacing
-      
-      ;; Disable eat's text blinking to reduce display changes
-      (when (bound-and-true-p eat-enable-blinking-text)
-        (setq-local eat-enable-blinking-text nil))
-      
-      ;; Force consistent character metrics for blinking symbols
-      ;;(setq-local char-width-table nil)         ; causes emacs to crash!
-      (setq-local vertical-scroll-bar nil)      ; Disable scroll bar
-      (setq-local fringe-mode 0)                ; Disable fringes that can cause reflow
-      
-      ;; Replace problematic blinking character with consistent asterisk
-      (let ((display-table (make-display-table)))
-        (aset display-table #x23fa [?✽])  ; Replace ⏺ (U+23FA) with ✽
-        (setq-local buffer-display-table display-table))
-      
-      ;; Set up custom key mappings & completion notifications after eat initialization
-      (run-with-timer 0.1 nil
-                      (lambda ()
-                        (claudemacs--setup-eat-integration buffer))))
-    
-    (let ((window (display-buffer buffer)))
-      (when claudemacs-switch-to-buffer-on-create
-        (select-window window)))))
+              ;; Set session state after the backend establishes its major mode.
+              (setq-local claudemacs--cwd work-dir)
+              (setq-local claudemacs--tool tool-name)
+              (setq-local claudemacs--instance-number instance)
+              (setq-local claudemacs--workspace-session-id
+                          (claudemacs--session-id work-dir))
+              ;; A reused buffer can still hold the identity of an older
+              ;; process.  Reset it before establishing this process's
+              ;; identity; ordinary library reloads never call this path and
+              ;; therefore preserve their buffer-local identity.
+              (claudemacs--set-session-identity nil 'unknown t)
+              (let ((provenance (plist-get identity-plan :provenance))
+                    (identity-id (plist-get identity-plan :id)))
+                (when (eq provenance 'exact)
+                  (claudemacs--set-session-identity identity-id 'exact t)))
+              (claudemacs--terminal-post-display buffer)
+              (run-with-timer
+               0.1 nil
+               (lambda ()
+                 (claudemacs--setup-terminal-integration buffer))))
+            (when claudemacs-switch-to-buffer-on-create
+              (select-window window))
+            buffer))
+      (error
+       (when (buffer-live-p buffer)
+         (kill-buffer buffer))
+       (error "Failed to start %s with terminal backend `%s': %s"
+              program terminal-backend (error-message-string error-data))))))
 
 (defun claudemacs--translate-args-for-tool (tool args)
   "Translate generic ARGS to tool-specific arguments for TOOL.
@@ -1193,10 +1610,14 @@ tool-specific equivalents."
 (defun claudemacs--run-with-args (tool &optional arg &rest args)
   "Start a new instance of AI coding tool TOOL with ARGS.
 TOOL should be a symbol from `claudemacs-tool-registry'.
-With prefix ARG, prompt for the project directory.
+With prefix ARG, prompt for the project directory.  A directory string in ARG
+is used directly; this lets an explicit history selection preserve its
+authoritative working directory without prompting a second time.
 ARGS are translated to tool-specific arguments.
 Always creates a new instance (claude, claude-2, etc.)."
-  (let* ((explicit-dir (when arg (read-directory-name "Project directory: ")))
+  (let* ((explicit-dir (cond
+                        ((stringp arg) arg)
+                        (arg (read-directory-name "Project directory: "))))
          (work-dir (or explicit-dir (claudemacs--project-root)))
          (translated-args (claudemacs--translate-args-for-tool tool args)))
     (apply #'claudemacs--start work-dir tool nil translated-args)))
@@ -1235,7 +1656,8 @@ Works with the most relevant session (current buffer, or most recent)."
       (progn
         (let ((tool (buffer-local-value 'claudemacs--tool claudemacs-buffer)))
           (with-current-buffer claudemacs-buffer
-            (eat-kill-process)
+            (claudemacs--terminal-kill))
+          (when (buffer-live-p claudemacs-buffer)
             (kill-buffer claudemacs-buffer))
           (message "Claudemacs session (%s) killed" tool)))
     (error "There is no Claudemacs session in this workspace or project")))
@@ -1258,72 +1680,56 @@ Presents a list of all active sessions in the workspace for selection."
                  (tool (plist-get info :tool)))
             (when (buffer-live-p buffer)
               (with-current-buffer buffer
-                (eat-kill-process)
+                (claudemacs--terminal-kill))
+              (when (buffer-live-p buffer)
                 (kill-buffer buffer))
               (message "Claudemacs session (%s) killed" tool))))))))
 
 ;;;###autoload
 (defun claudemacs-branch-session ()
-  "Branch from a specific session, prompting if multiple exist.
-For Claude sessions with a tracked UUID, uses --resume UUID --fork-session.
-For Codex sessions, queries the Codex SQLite database for sessions matching
-the working directory and uses codex fork UUID.
-Falls back to tool defaults when no UUID is available."
+  "Branch from an explicitly selected authoritative session.
+
+Claude receives an explicit source and generated destination UUID.  Codex
+receives an explicit source ID, but its new destination remains unknown
+because the installed CLI has no destination-ID option.  A bare `--continue',
+`resume', `--last', or picker fallback is never used."
   (interactive)
   (let* ((sessions (claudemacs--list-sessions-for-workspace))
-         (session (car sessions))
-         (tool (if session
-                   (plist-get session :tool)
-                 claudemacs-default-tool))
-         ;; Extract work-dir early (codex needs it for SQLite query)
-         (session-buffer (plist-get session :buffer))
-         (work-dir (if (and session-buffer (buffer-live-p session-buffer))
-                       (buffer-local-value 'claudemacs--cwd session-buffer)
-                     (claudemacs--project-root)))
-         ;; Tool-specific UUID discovery
-         (session-uuid
-          (pcase tool
-            ('claude
-             (let* ((uuid-sessions (seq-filter (lambda (s) (plist-get s :claude-uuid))
-                                               sessions))
-                    (selected
-                     (cond
-                      ((> (length uuid-sessions) 1)
-                       (let* ((choices (mapcar
-                                        (lambda (s)
-                                          (cons (plist-get s :buffer-name) s))
-                                        uuid-sessions))
-                              (selected-name (completing-read
-                                              "Branch from session: "
-                                              (mapcar #'car choices) nil t)))
-                         (cdr (assoc selected-name choices))))
-                      ((= (length uuid-sessions) 1)
-                       (car uuid-sessions))
-                      (t session))))
-               ;; Update work-dir from selected session
-               (when (and selected (plist-get selected :buffer)
-                          (buffer-live-p (plist-get selected :buffer)))
-                 (setq work-dir (buffer-local-value 'claudemacs--cwd
-                                                    (plist-get selected :buffer))))
-               (plist-get selected :claude-uuid)))
-            ('codex
-             (let ((codex-sessions (claudemacs--codex-discover-sessions work-dir)))
-               (cond
-                ((> (length codex-sessions) 1)
-                 (let* ((choices (mapcar
-                                  (lambda (s)
-                                    (cons (claudemacs--codex-format-session-choice s) s))
-                                  codex-sessions))
-                        (selected-name (completing-read
-                                        "Branch from Codex session: "
-                                        (mapcar #'car choices) nil t)))
-                   (plist-get (cdr (assoc selected-name choices)) :id)))
-                ((= (length codex-sessions) 1)
-                 (plist-get (car codex-sessions) :id))
-                (t nil))))
-            (_ nil)))
-         (branch-args (claudemacs--get-branch-args tool session-uuid)))
-    (apply #'claudemacs--start work-dir tool nil branch-args)))
+         (session (car sessions)))
+    (unless session
+      (user-error "No live Claudemacs session is available to branch"))
+    (let* ((tool (plist-get session :tool))
+           (session-buffer (plist-get session :buffer))
+           (work-dir (and (buffer-live-p session-buffer)
+                          (buffer-local-value 'claudemacs--cwd session-buffer)))
+           (work-dir (or work-dir (claudemacs--project-root)))
+           (live-identities
+            (seq-filter
+             (lambda (info)
+               (memq (plist-get info :identity-provenance)
+                     '(exact discovered)))
+             (seq-filter (lambda (info) (eq (plist-get info :tool) tool))
+                         sessions)))
+           (source-id
+            (cond
+             ;; A single tracked identity is already authoritative.  When
+             ;; there are multiple sessions, let the history provider choose
+             ;; explicitly rather than using display order.
+             ((and (= (length live-identities) 1)
+                   (= (length (seq-filter
+                               (lambda (info) (eq (plist-get info :tool) tool))
+                               sessions))
+                      1))
+              (plist-get (car live-identities) :authoritative-session-id))
+             (t (claudemacs--select-history-session-id tool work-dir))))
+           (destination-id (when (eq tool 'claude)
+                             (claudemacs--generate-uuid)))
+           (branch-args (or (claudemacs--get-branch-args
+                            tool source-id destination-id)
+                            (user-error
+                             "No authoritative %s session ID is available"
+                             (capitalize (symbol-name tool))))))
+      (apply #'claudemacs--start work-dir tool nil branch-args))))
 
 (defun claudemacs--validate-process ()
   "Validate that the Claudemacs process is alive and running.
@@ -1332,11 +1738,11 @@ Works with the most relevant session (current buffer, or most recent)."
     (unless buffer
       (error "No Claudemacs session is active"))
     (with-current-buffer buffer
-      (unless (and (boundp 'eat-terminal) eat-terminal)
+      (unless (and claudemacs--terminal-backend
+                   (claudemacs--terminal-ready-p))
         (error "Claudemacs session exists but terminal is not initialized. Please kill buffer and restart"))
-      (let ((process (eat-term-parameter eat-terminal 'eat--process)))
-        (unless (and process (process-live-p process))
-          (error "Claudemacs session exists but process is not running. Please kill buffer and restart")))))
+      (unless (claudemacs--terminal-live-p)
+        (error "Claudemacs session exists but process is not running. Please kill buffer and restart"))))
   t)
 
 (defun claudemacs--validate-file-and-session ()
@@ -1369,24 +1775,27 @@ Returns a plist with :file-path, :project-cwd, :relative-path,
           :absolute-path file-path
           :outside-cwd outside-cwd)))
 
-(defun claudemacs--send-return-for-tool (terminal _buffer &optional _tool)
-  "Send return key event to TERMINAL.
-Uses eat-term-input-event which sends an actual key event rather than
-a raw string, working reliably across different CLI tools."
-  (eat-term-input-event terminal 1 'return))
+(defun claudemacs--send-return-for-tool (_buffer &optional _tool)
+  "Send a return key event through the current terminal backend."
+  (claudemacs--terminal-send-key 'return))
 
 (defun claudemacs--send-to-buffer (buffer message &optional no-return tool)
-  "Send MESSAGE to BUFFER's eat terminal.
+  "Send MESSAGE to BUFFER's terminal.
 If NO-RETURN is non-nil, don't send a return/newline."
   (with-current-buffer buffer
     (let* ((resolved-tool (or tool claudemacs--tool 'claude))
            (plain-message (substring-no-properties message)))
-      (if (and (eq resolved-tool 'codex)
-               (fboundp 'eat-term-send-string-as-yank))
-          (eat-term-send-string-as-yank eat-terminal (list plain-message))
-        (eat-term-send-string eat-terminal plain-message))
+      (if (eq resolved-tool 'codex)
+          (claudemacs--terminal-paste-string plain-message)
+        (claudemacs--terminal-send-string plain-message))
       (unless no-return
-        (claudemacs--send-return-for-tool eat-terminal buffer resolved-tool)))))
+        ;; Ghostel can otherwise classify adjacent text and Return writes as
+        ;; one paste burst.  Delay only this text-plus-submit path; standalone
+        ;; Return commands should remain immediate.
+        (when (and (eq claudemacs--terminal-backend 'ghostel)
+                   (> claudemacs-ghostel-submit-delay 0))
+          (sleep-for claudemacs-ghostel-submit-delay))
+        (claudemacs--send-return-for-tool buffer resolved-tool)))))
 
 (defun claudemacs--build-prompt (base-prompt)
   "Build a dynamic prompt based on whether C-u was pressed and which tool(s) are active.
@@ -1450,24 +1859,6 @@ content from that line is actually selected."
       (format "File context: %s:%d\n" relative-path start-line)
     (format "File context: %s:%d-%d\n" relative-path start-line end-line)))
 
-(defun claudemacs--scroll-to-bottom ()
-  "Scroll the claudemacs buffer to bottom without switching to it."
-  (interactive)
-  (when-let* ((claude-buffer (claudemacs--get-current-session-buffer))
-              (claude-window (get-buffer-window claude-buffer)))
-    (with-current-buffer claude-buffer
-      (goto-char (point-max))
-      (set-window-point claude-window (point-max)))))
-
-(defun claudemacs--scroll-to-top ()
-  "Scroll the claudemacs buffer to top without switching to it."
-  (interactive)
-  (when-let* ((claude-buffer (claudemacs--get-current-session-buffer))
-              (claude-window (get-buffer-window claude-buffer)))
-    (with-current-buffer claude-buffer
-      (goto-char (point-min))
-      (set-window-point claude-window (point-min)))))
-
 ;;;;
 ;;;; Action Processing System
 ;;;;
@@ -1499,7 +1890,7 @@ Otherwise, send to current/active session only."
                      ;; Copy to avoid potential destructive mutations by terminal input handlers.
                      (session-message (copy-sequence message-text)))
                 (claudemacs--send-to-buffer session-buffer session-message no-return session-tool)
-                ;; Small delay to ensure eat terminal processes the input
+                ;; Give the terminal process a chance to consume each message.
                 (sit-for 0.05)))
             (message "%s (sent to %d session%s in current workspace)"
                     user-message
@@ -1849,17 +2240,27 @@ INDEX is 0-based."
         (apply #'claudemacs--run-with-args tool prompt-for-dir filtered-args)))))
 
 (defun claudemacs--resume-tool-by-index (index)
-  "Resume the tool at INDEX in the tool registry.
-INDEX is 0-based."
+  "Resume the tool at INDEX using an explicitly selected history ID.
+INDEX is 0-based.  The CLI's interactive picker is never launched from this
+command because Claudemacs could not attach its authoritative ID to the new
+buffer in that case."
   (let* ((tools (mapcar #'car claudemacs-tool-registry))
          (tool (nth index tools)))
     (when tool
-      (let* ((resume-flag (claudemacs--get-resume-flag tool))
-             (args (transient-args 'claudemacs-resume-menu))
+      (let* ((args (transient-args 'claudemacs-resume-menu))
              (prompt-for-dir (member "--prompt-project-root" args))
              (filtered-args (remove "--prompt-project-root" args))
+             (work-dir (if prompt-for-dir
+                           (read-directory-name "Project directory: ")
+                         (claudemacs--project-root)))
+             (session-id (claudemacs--select-history-session-id tool work-dir))
+             (resume-args (claudemacs--get-resume-args tool session-id))
              (claudemacs-switch-to-buffer-on-create t))  ; Always switch when resuming
-        (apply #'claudemacs--run-with-args tool prompt-for-dir resume-flag filtered-args)))))
+        ;; Pass the directory selected for history lookup through the common
+        ;; launcher.  Recomputing `claudemacs--project-root' here could launch
+        ;; the CLI in a different project than the one whose ID was selected.
+        (apply #'claudemacs--run-with-args tool work-dir
+               (append resume-args filtered-args))))))
 
 (defun claudemacs--setup-start-tool-suffixes (_)
   "Generate tool suffixes dynamically for the start menu.
@@ -1925,6 +2326,7 @@ Returns a list of parsed transient suffix objects."
     ("r" "Resume Session..." claudemacs-resume-menu)
     ("k" "Kill Session..." claudemacs-kill-specific-session)
     ("b" "Branch Current Session" claudemacs-branch-session)
+    ("l" "List Live Sessions" claudemacs-session-list)
     ("t" "Toggle Buffer" claudemacs-toggle-buffer)]
    ["Actions (Use C-u to send to all sessions)"
     ("e" "Fix Error at Point" claudemacs-fix-error-at-point)
@@ -1956,102 +2358,26 @@ Returns a list of parsed transient suffix objects."
   :keymap claudemacs-mode-map
   :group 'claudemacs)
 
-(defun claudemacs--show-cursor (&rest _args)
-  "Show cursor in Claudemacs buffers when in Emacs mode."
-  (when (claudemacs--is-claudemacs-buffer-p)
-    (setq-local cursor-type 'box)))
-
-(defun claudemacs--hide-cursor (&rest _args)
-  "Hide cursor in Claudemacs buffers when in semi-char mode."
-  (when (claudemacs--is-claudemacs-buffer-p)
-    ;; Only force terminal cursor visibility for Claude, not other tools like Codex
-    (when (and (boundp 'eat-terminal) eat-terminal
-               (eq claudemacs--tool 'claude))
-      (setq-local cursor-type nil))))
-
-(defun claudemacs--check-and-disable-window-adjust (&rest _)
-  "Check if buffer is longer than one screen and disable window adjustment if so."
-  (when (and (not (eq window-adjust-process-window-size-function 'ignore))
-             (claudemacs--is-claudemacs-buffer-p))
-    (let* ((claude-buffer (current-buffer))
-           (claude-window (get-buffer-window claude-buffer))
-           (window-ht (when claude-window (window-height claude-window)))
-           (buffer-lines (count-lines (point-min) (point-max))))
-      ;; If buffer has more lines than window height, switch to 'ignore mode
-      (when (and window-ht (> buffer-lines window-ht))
-        (goto-char (point-min))
-        (redisplay)
-        (goto-char (point-max))
-        (redisplay)
-        ;; CRITICAL: Disable window-adjust-process-window-size-function to prevent
-        ;; terminal redraw/scroll reset on buffer switching (same issue as vterm #149)
-        (setq-local window-adjust-process-window-size-function 'ignore)))))
-
-(defun claudemacs--eat-force-redraw ()
-  "Forces the eat terminal and the underlying program to redraw.
-
-This is useful if the display becomes corrupted after Emacs window
-resizes or other external changes that might not have been fully
-propagated. It attempts to resynchronize the PTY size, the
-eat emulator's internal dimensions, and trigger a redisplay."
-  (interactive)
-  (with-current-buffer (claudemacs--get-current-session-buffer)
-    (when (and (boundp 'eat-terminal) eat-terminal)
-        (let* ((process (eat-term-parameter eat-terminal 'eat--process))
-               (claude-window (get-buffer-window (claudemacs--get-current-session-buffer))))
-          (if (and process (process-live-p process) claude-window)
-              (eat--adjust-process-window-size process (list claude-window)))))))
-
 (defun claudemacs-unstick-terminal ()
-  "Reset the claudemacs buffer's vertical rest point.
-Sometimes the input box gets stuck mid or top of the buffer because of
-the idiosyncracies of eat-mode. This will reset the input box to the
-bottom of the buffer."
+  "Ask the active session's terminal backend to recover its display."
   (interactive)
   (claudemacs--validate-process)
   (when (claudemacs--is-claudemacs-buffer-p)
     (error "Reset buffer cannot be used while visiting the claudemacs buffer itself"))
-  (claudemacs--eat-force-redraw)
   (with-current-buffer (claudemacs--get-current-session-buffer)
-    (setq-local window-adjust-process-window-size-function
-                'window-adjust-process-window-size-smallest))
-  (claudemacs--scroll-to-top)
-  (redisplay)
-  (claudemacs--scroll-to-bottom)
-  (redisplay)
-  (with-current-buffer (claudemacs--get-current-session-buffer)
-    ;; CRITICAL: Disable window-adjust-process-window-size-function to prevent
-    ;; terminal redraw/scroll reset on buffer switching (same issue as vterm #149)
-    (setq-local window-adjust-process-window-size-function 'ignore)))
+    (claudemacs--terminal-unstick)))
 
 ;;;###autoload
 (defun claudemacs-setup ()
-  "Set up claudemacs hooks and advice.
+  "Set up integrations for loaded Claudemacs terminal backends.
 This is called automatically when the package is loaded.
-Safe to call multiple times - will not add duplicate hooks or advice."
+Safe to call multiple times."
   (interactive)
-  ;; Hook to manage window adjustment for terminal buffers
-  (unless (memq #'claudemacs--check-and-disable-window-adjust window-buffer-change-functions)
-    (add-hook 'window-buffer-change-functions #'claudemacs--check-and-disable-window-adjust))
-  ;; Advice for cursor visibility in eat modes
-  (unless (advice-member-p #'claudemacs--show-cursor 'eat-emacs-mode)
-    (advice-add 'eat-emacs-mode :after #'claudemacs--show-cursor))
-  (unless (advice-member-p #'claudemacs--hide-cursor 'eat-semi-char-mode)
-    (advice-add 'eat-semi-char-mode :after #'claudemacs--hide-cursor))
-  ;; Override C-b on eat-semi-char-mode-map directly, since minor mode
-  ;; maps take precedence over local maps.  The command is conditional
-  ;; so non-claudemacs eat buffers are unaffected.
-  (when (boundp 'eat-semi-char-mode-map)
-    (define-key eat-semi-char-mode-map (kbd "C-b") #'claudemacs--maybe-left-key)))
+  (claudemacs--terminal-setup-loaded-backends))
 
 (defun claudemacs-unload-function ()
-  "Cleanup when unloading claudemacs.
-Removes advice and hooks added by `claudemacs-setup'."
-  (advice-remove 'eat-emacs-mode #'claudemacs--show-cursor)
-  (advice-remove 'eat-semi-char-mode #'claudemacs--hide-cursor)
-  (remove-hook 'window-buffer-change-functions #'claudemacs--check-and-disable-window-adjust)
-  (when (boundp 'eat-semi-char-mode-map)
-    (define-key eat-semi-char-mode-map (kbd "C-b") #'eat-self-input))
+  "Clean up terminal backend integrations."
+  (claudemacs--terminal-teardown-loaded-backends)
   nil)
 
 ;; Auto-setup when package is loaded

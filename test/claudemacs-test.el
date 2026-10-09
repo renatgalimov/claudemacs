@@ -401,36 +401,8 @@ TITLE and CLAUDE-UUID are optional and set the matching buffer-locals."
 
 ;;; Startup Hook Behavior Tests
 
-(ert-deftest claudemacs-test-codex-cursor-blinking-disabled ()
-  "Test that Codex cursor styles use eat's non-blinking equivalents."
-  :tags '(:unit :codex :cursor)
-  (claudemacs-test-with-temp-buffer
-   (let ((claudemacs--tool 'codex)
-         (applied-state nil))
-     (setq-local eat-terminal 'fake-terminal)
-     (setq-local eat-default-cursor-type '(t nil nil))
-     (setq-local eat-very-visible-cursor-type '(t 2 hollow))
-     (setq-local eat-vertical-bar-cursor-type '(bar nil nil))
-     (setq-local eat-very-visible-vertical-bar-cursor-type '(bar 2 nil))
-     (setq-local eat-horizontal-bar-cursor-type '(hbar nil nil))
-     (setq-local eat-very-visible-horizontal-bar-cursor-type '(hbar 2 nil))
-     (cl-letf (((symbol-function 'eat-term-parameter)
-                (lambda (_terminal parameter)
-                  (when (eq parameter 'set-cursor-function)
-                    (lambda (_terminal state)
-                      (setq applied-state state)))))
-               ((symbol-function 'eat-term-cursor-type)
-                (lambda (_terminal) :blinking-block)))
-       (claudemacs--disable-codex-cursor-blink))
-     (should (equal eat-very-visible-cursor-type '(t nil nil)))
-     (should (equal eat-very-visible-vertical-bar-cursor-type
-                    '(bar nil nil)))
-     (should (equal eat-very-visible-horizontal-bar-cursor-type
-                    '(hbar nil nil)))
-     (should (eq applied-state :blinking-block)))))
-
 (ert-deftest claudemacs-test-startup-hook-called-during-setup ()
-  "Test that claudemacs-startup-hook is called during eat integration setup."
+  "Test that `claudemacs-startup-hook' runs during terminal setup."
   :tags '(:integration :startup-hook)
   (let ((hook-called nil)
         (hook-called-in-claudemacs-buffer nil)
@@ -443,23 +415,23 @@ TITLE and CLAUDE-UUID are optional and set the matching buffer-locals."
                 (when (claudemacs--is-claudemacs-buffer-p)
                   (setq hook-called-in-claudemacs-buffer t))))
     
-    ;; Mock the bell handler and title tracking setup to avoid session ID dependency
-    (cl-letf (((symbol-function 'claudemacs-setup-bell-handler)
-               (lambda () nil))
-              ((symbol-function 'claudemacs-setup-title-tracking)
-               (lambda () nil)))
+    ;; Mock bell handler, title tracking and terminal readiness
+    (cl-letf (((symbol-function 'claudemacs-setup-bell-handler) #'ignore)
+              ((symbol-function 'claudemacs-setup-title-tracking) #'ignore)
+              ((symbol-function 'claudemacs--terminal-ready-p)
+               (lambda () t))
+              ((symbol-function 'claudemacs--terminal-setup-faces) #'ignore))
       
       (unwind-protect
           (progn
             ;; Create a buffer that looks like a claudemacs buffer
             (setq test-buffer (get-buffer-create "*claudemacs:test-hook*"))
             (with-current-buffer test-buffer
-              ;; Set up minimal fake eat-terminal
-              (setq-local eat-terminal 'fake-terminal)
+              (setq-local claudemacs--terminal-backend 'fake)
               (setq-local claudemacs--tool 'claude))
             
             ;; Call the setup function directly
-            (claudemacs--setup-eat-integration test-buffer)
+            (claudemacs--setup-terminal-integration test-buffer)
             
             ;; Verify hook was called
             (should hook-called)
@@ -485,23 +457,23 @@ TITLE and CLAUDE-UUID are optional and set the matching buffer-locals."
     (add-hook 'claudemacs-startup-hook (lambda () (setq hook1-called t)))
     (add-hook 'claudemacs-startup-hook (lambda () (setq hook2-called t)))
     
-    ;; Mock the bell handler and title tracking setup to avoid session ID dependency
-    (cl-letf (((symbol-function 'claudemacs-setup-bell-handler)
-               (lambda () nil))
-              ((symbol-function 'claudemacs-setup-title-tracking)
-               (lambda () nil)))
+    ;; Mock bell handler, title tracking and terminal readiness
+    (cl-letf (((symbol-function 'claudemacs-setup-bell-handler) #'ignore)
+              ((symbol-function 'claudemacs-setup-title-tracking) #'ignore)
+              ((symbol-function 'claudemacs--terminal-ready-p)
+               (lambda () t))
+              ((symbol-function 'claudemacs--terminal-setup-faces) #'ignore))
       
       (unwind-protect
           (progn
             ;; Create a buffer that looks like a claudemacs buffer
             (setq test-buffer (get-buffer-create "*claudemacs:test-multiple*"))
             (with-current-buffer test-buffer
-              ;; Set up minimal fake eat-terminal
-              (setq-local eat-terminal 'fake-terminal)
+              (setq-local claudemacs--terminal-backend 'fake)
               (setq-local claudemacs--tool 'claude))
             
             ;; Call the setup function directly
-            (claudemacs--setup-eat-integration test-buffer)
+            (claudemacs--setup-terminal-integration test-buffer)
             
             ;; Verify both hooks were called
             (should hook1-called)
@@ -526,11 +498,12 @@ TITLE and CLAUDE-UUID are optional and set the matching buffer-locals."
                 (setq captured-buffer-name (buffer-name))
                 (setq captured-cwd claudemacs--cwd)))
     
-    ;; Mock the bell handler and title tracking setup to avoid session ID dependency
-    (cl-letf (((symbol-function 'claudemacs-setup-bell-handler)
-               (lambda () nil))
-              ((symbol-function 'claudemacs-setup-title-tracking)
-               (lambda () nil)))
+    ;; Mock bell handler, title tracking and terminal readiness
+    (cl-letf (((symbol-function 'claudemacs-setup-bell-handler) #'ignore)
+              ((symbol-function 'claudemacs-setup-title-tracking) #'ignore)
+              ((symbol-function 'claudemacs--terminal-ready-p)
+               (lambda () t))
+              ((symbol-function 'claudemacs--terminal-setup-faces) #'ignore))
       
       (unwind-protect
           (progn
@@ -538,12 +511,12 @@ TITLE and CLAUDE-UUID are optional and set the matching buffer-locals."
             (setq test-buffer (get-buffer-create "*claudemacs:test-context*"))
             (with-current-buffer test-buffer
               ;; Set up minimal fake environment
-              (setq-local eat-terminal 'fake-terminal)
+              (setq-local claudemacs--terminal-backend 'fake)
               (setq-local claudemacs--tool 'claude)
               (setq-local claudemacs--cwd "/test/directory"))
             
             ;; Call the setup function directly
-            (claudemacs--setup-eat-integration test-buffer)
+            (claudemacs--setup-terminal-integration test-buffer)
             
             ;; Verify hook ran in correct buffer context
             (should captured-buffer-name)
@@ -573,20 +546,21 @@ TITLE and CLAUDE-UUID are optional and set the matching buffer-locals."
     ;; Mock the other setup functions to track completion
     (cl-letf (((symbol-function 'claudemacs--setup-buffer-keymap)
                (lambda () (setq setup-completed t)))
-              ((symbol-function 'claudemacs-setup-bell-handler)
-               (lambda () nil)))
+              ((symbol-function 'claudemacs-setup-bell-handler) #'ignore)
+              ((symbol-function 'claudemacs--terminal-ready-p)
+               (lambda () t))
+              ((symbol-function 'claudemacs--terminal-setup-faces) #'ignore))
       
       (unwind-protect
           (progn
             ;; Create a buffer that looks like a claudemacs buffer
             (setq test-buffer (get-buffer-create "*claudemacs:test-error*"))
             (with-current-buffer test-buffer
-              ;; Set up minimal fake eat-terminal
-              (setq-local eat-terminal 'fake-terminal))
+              (setq-local claudemacs--terminal-backend 'fake))
             
             ;; Call the setup function and expect it to handle errors gracefully
             (condition-case err
-                (claudemacs--setup-eat-integration test-buffer)
+                (claudemacs--setup-terminal-integration test-buffer)
               (error (setq hook-error-occurred t)))
             
             ;; Setup should have completed despite hook error
@@ -630,6 +604,69 @@ TITLE and CLAUDE-UUID are optional and set the matching buffer-locals."
   (let ((claudemacs-codex-notification-switches nil))
     (should-not (claudemacs--get-tool-notification-switches 'codex))))
 
+(ert-deftest claudemacs-test-ghostel-submit-separates-text-and-return ()
+  "Test that programmatic Ghostel submission creates an input boundary."
+  :tags '(:unit :ghostel :terminal-backend)
+  (let (events)
+    (cl-letf (((symbol-function 'claudemacs--terminal-send-string)
+               (lambda (string)
+                 (setq events (append events (list (list :text string))))))
+              ((symbol-function 'sleep-for)
+               (lambda (seconds &optional _milliseconds)
+                 (setq events (append events (list (list :delay seconds))))))
+              ((symbol-function 'claudemacs--terminal-send-key)
+               (lambda (key)
+                 (setq events (append events (list (list :key key)))))))
+      (with-temp-buffer
+        (setq-local claudemacs--terminal-backend 'ghostel)
+        (setq-local claudemacs--tool 'claude)
+        (claudemacs--send-to-buffer (current-buffer) "Fix this"))
+      (should (equal events
+                     '((:text "Fix this") (:delay 0.15) (:key return)))))))
+
+(ert-deftest claudemacs-test-ghostel-submit-delay-is-configurable ()
+  "Test that Ghostel's programmatic submit boundary can be adjusted."
+  :tags '(:unit :ghostel :terminal-backend)
+  (let ((claudemacs-ghostel-submit-delay 0.3)
+        observed-delay)
+    (cl-letf (((symbol-function 'sleep-for)
+               (lambda (seconds &optional _milliseconds)
+                 (setq observed-delay seconds)))
+              ((symbol-function 'claudemacs--terminal-send-string) #'ignore)
+              ((symbol-function 'claudemacs--terminal-send-key) #'ignore))
+      (with-temp-buffer
+        (setq-local claudemacs--terminal-backend 'ghostel)
+        (claudemacs--send-to-buffer (current-buffer) "Fix this"))
+      (should (= observed-delay 0.3)))))
+
+(ert-deftest claudemacs-test-ghostel-standalone-return-is-immediate ()
+  "Test that standalone Ghostel Return does not pay the paste delay."
+  :tags '(:unit :ghostel :terminal-backend)
+  (let (events)
+    (cl-letf (((symbol-function 'sleep-for)
+               (lambda (&rest _arguments)
+                 (push 'unexpected-delay events)))
+              ((symbol-function 'claudemacs--terminal-send-key)
+               (lambda (key)
+                 (push (list :key key) events))))
+      (let ((claudemacs--terminal-backend 'ghostel))
+        (claudemacs--send-return-for-tool (current-buffer)))
+      (should (equal events '((:key return)))))))
+
+(ert-deftest claudemacs-test-eat-submit-has-no-ghostel-delay ()
+  "Test that Eat submission remains immediate."
+  :tags '(:unit :eat :terminal-backend)
+  (let (events)
+    (cl-letf (((symbol-function 'sleep-for)
+               (lambda (&rest _arguments)
+                 (push 'unexpected-delay events)))
+              ((symbol-function 'claudemacs--terminal-send-key)
+               (lambda (key)
+                 (push (list :key key) events))))
+      (let ((claudemacs--terminal-backend 'eat))
+        (claudemacs--send-return-for-tool (current-buffer)))
+      (should (equal events '((:key return)))))))
+
 (ert-deftest claudemacs-test-notification-sound-behavior ()
   "Test that claudemacs-notification-sound-mac affects notification calls."
   :tags '(:unit :config)
@@ -654,6 +691,79 @@ TITLE and CLAUDE-UUID are optional and set the matching buffer-locals."
         (claudemacs--system-notification "Test message" "Test title") 
         (should notification-command)
         (should (string-match-p "Glass" notification-command))))))
+
+(ert-deftest claudemacs-test-windows-notification-is-non-modal ()
+  "Test that Windows uses a native tray notification, not a dialog."
+  :tags '(:unit :config :windows)
+  (let (notification-arguments
+        called-program)
+    (cl-letf (((symbol-function 'claudemacs--windows-notification)
+               (lambda (&rest args)
+                 (setq notification-arguments args)))
+              ((symbol-function 'call-process)
+               (lambda (program &rest _args)
+                 (setq called-program program)))
+              (system-type 'windows-nt))
+      (claudemacs--system-notification "Finished" "Claudemacs")
+      (should (equal notification-arguments
+                     '("Finished" "Claudemacs")))
+      (should-not called-program))))
+
+(ert-deftest claudemacs-test-windows-toast-launches-helper-directly ()
+  "Test that toast arguments are passed directly to PowerShell."
+  :tags '(:unit :config :windows)
+  (let (process-arguments)
+    (cl-letf (((symbol-function 'claudemacs--windows-notification-script)
+               (lambda () "C:/claudemacs/claudemacs-toast.ps1"))
+              ((symbol-function 'executable-find)
+               (lambda (_program) "C:/Windows/powershell.exe"))
+              ((symbol-function 'make-process)
+               (lambda (&rest args) (setq process-arguments args))))
+      (claudemacs--launch-windows-notification
+       "Finished & waiting" "Claude's session")
+      (should
+       (equal (plist-get process-arguments :command)
+              '("C:/Windows/powershell.exe"
+                "-NoProfile" "-WindowStyle" "Hidden"
+                "-ExecutionPolicy" "Bypass"
+                "-File" "C:/claudemacs/claudemacs-toast.ps1"
+                "-Title" "Claude's session"
+                "-Message" "Finished & waiting"
+                "-TimeoutSeconds" "5"))))))
+
+(ert-deftest claudemacs-test-windows-toast-auto-installs-identity ()
+  "Test that the Windows identity is refreshed once per Emacs process."
+  :tags '(:unit :config :windows)
+  (let ((claudemacs--windows-notification-identity-ready nil)
+        (install-count 0)
+        launched)
+    (cl-letf (((symbol-function 'claudemacs--install-windows-notification-shortcut)
+               (lambda ()
+                 (cl-incf install-count)
+                 "C:/Start Menu/Claudemacs.lnk"))
+              ((symbol-function 'claudemacs--launch-windows-notification)
+               (lambda (&rest _arguments) (setq launched t))))
+      (claudemacs--windows-notification "Finished" "Claudemacs")
+      (claudemacs--windows-notification "Finished again" "Claudemacs")
+      (should launched)
+      (should (= install-count 1)))))
+
+(ert-deftest claudemacs-test-windows-toast-helper-explicitly-dismisses ()
+  "Test that the Windows helper hides displayed toasts after its timeout."
+  :tags '(:unit :config :windows)
+  (let* ((library-directory
+          (file-name-directory
+           (or (symbol-file 'claudemacs--system-notification 'defun)
+               (locate-library "claudemacs"))))
+         (script (expand-file-name "claudemacs-toast.ps1"
+                                   library-directory))
+         (contents (with-temp-buffer
+                     (insert-file-contents script)
+                     (buffer-string))))
+    (should (string-match-p
+             "Start-Sleep -Seconds \\$TimeoutSeconds" contents))
+    (should (string-match-p
+             "\\$notifier\\.Hide(\\$toast)" contents))))
 
 (ert-deftest claudemacs-test-program-switches-behavior ()
   "Test that claudemacs-program-switches affects command construction."
@@ -950,7 +1060,7 @@ This function is called by the transient menu and must never error."
 
         ;; Test killing when in a claudemacs buffer
         (cl-letf (((symbol-function 'claudemacs--session-id) (lambda () "test-kill-current"))
-                  ((symbol-function 'eat-kill-process) (lambda () nil)))
+                  ((symbol-function 'claudemacs--terminal-kill) #'ignore))
           (let ((buf (claudemacs-test-make-session-buffer 'claude 1 "test-kill-current")))
             (with-current-buffer buf
               (setq-local buffer-display-time (current-time))
@@ -960,7 +1070,7 @@ This function is called by the transient menu and must never error."
 
         ;; Test killing most recent session when not in claudemacs buffer
         (cl-letf (((symbol-function 'claudemacs--session-id) (lambda () "test-kill-recent"))
-                  ((symbol-function 'eat-kill-process) (lambda () nil)))
+                  ((symbol-function 'claudemacs--terminal-kill) #'ignore))
           (let ((buf (claudemacs-test-make-session-buffer 'claude 1 "test-kill-recent")))
             (with-current-buffer buf
               (setq-local buffer-display-time (current-time)))
@@ -984,7 +1094,7 @@ This function is called by the transient menu and must never error."
   :tags '(:unit :kill)
   (unwind-protect
       (cl-letf (((symbol-function 'claudemacs--session-id) (lambda () "test-kill-specific"))
-                ((symbol-function 'eat-kill-process) (lambda () nil)))
+                ((symbol-function 'claudemacs--terminal-kill) #'ignore))
         (let ((buf1 (claudemacs-test-make-session-buffer 'claude 1 "test-kill-specific"))
               (buf2 (claudemacs-test-make-session-buffer 'codex 1 "test-kill-specific")))
           ;; Setup buffers with tool info
@@ -1023,7 +1133,7 @@ This function is called by the transient menu and must never error."
 
           ;; Mock session-id to return workspace-a
           (cl-letf (((symbol-function 'claudemacs--session-id) (lambda () workspace-a-session-id))
-                    ((symbol-function 'eat-kill-process) (lambda () nil)))
+                    ((symbol-function 'claudemacs--terminal-kill) #'ignore))
             ;; Kill should only affect workspace-a
             (claudemacs-kill)
             (should-not (buffer-live-p buf-a))
@@ -1034,22 +1144,23 @@ This function is called by the transient menu and must never error."
 ;;; Branch/Continue Session Tests
 
 (ert-deftest claudemacs-test-get-branch-args-per-tool ()
-  "Test that each tool returns correct branch arguments."
+  "Branch arguments require an authoritative source ID."
   :tags '(:unit :branch)
-  ;; Claude without UUID falls back to --continue --fork-session
-  (should (equal (claudemacs--get-branch-args 'claude) '("--continue" "--fork-session")))
-  ;; Claude with UUID uses --resume UUID --fork-session
+  ;; Missing IDs fail closed instead of invoking a picker or --last.
+  (should-not (claudemacs--get-branch-args 'claude))
+  (should-not (claudemacs--get-branch-args 'codex))
   (should (equal (claudemacs--get-branch-args 'claude "abc-123")
                  '("--resume" "abc-123" "--fork-session")))
-  ;; Codex without UUID uses fork --last
-  (should (equal (claudemacs--get-branch-args 'codex) '("fork" "--last")))
-  ;; Codex with UUID uses fork UUID
+  (should (equal (claudemacs--get-branch-args
+                  'claude "abc-123" "destination-id")
+                 '("--resume" "abc-123" "--fork-session"
+                   "--session-id" "destination-id")))
   (should (equal (claudemacs--get-branch-args 'codex "019cbad9-9004-7b33-b212-0261d35fc7b7")
                  '("fork" "019cbad9-9004-7b33-b212-0261d35fc7b7")))
-  ;; Gemini uses --resume
-  (should (equal (claudemacs--get-branch-args 'gemini) '("--resume")))
-  ;; Unknown tools default to --continue
-  (should (equal (claudemacs--get-branch-args 'unknown-tool) '("--continue"))))
+  (should (equal (claudemacs--get-branch-args 'gemini "source-id")
+                 '("--resume" "source-id")))
+  (should (equal (claudemacs--get-branch-args 'unknown-tool "source-id")
+                 '("--resume" "source-id"))))
 
 (ert-deftest claudemacs-test-generate-uuid ()
   "Test that generated UUIDs have valid v4 format and are unique."
@@ -1071,50 +1182,6 @@ This function is called by the transient menu and must never error."
   (should (equal (claudemacs--get-resume-flag 'codex) "resume"))
   ;; Unknown tools default to --resume
   (should (equal (claudemacs--get-resume-flag 'unknown-tool) "--resume")))
-
-;;; Codex Session Discovery Tests
-
-(ert-deftest claudemacs-test-codex-discover-sessions-no-sqlite3 ()
-  "Test that codex session discovery returns nil when sqlite3 is not available."
-  :tags '(:unit :branch)
-  (cl-letf (((symbol-function 'executable-find) (lambda (_prog) nil)))
-    (should-not (claudemacs--codex-discover-sessions "/some/path"))))
-
-(ert-deftest claudemacs-test-codex-discover-sessions-no-db ()
-  "Test that codex session discovery returns nil when database doesn't exist."
-  :tags '(:unit :branch)
-  (cl-letf (((symbol-function 'executable-find) (lambda (_prog) t))
-            ((symbol-function 'file-exists-p) (lambda (_path) nil)))
-    (should-not (claudemacs--codex-discover-sessions "/some/path"))))
-
-(ert-deftest claudemacs-test-codex-format-session-choice ()
-  "Test Codex session choice formatting."
-  :tags '(:unit :branch)
-  ;; Mock last-user-prompt to avoid hitting real files
-  (cl-letf (((symbol-function 'claudemacs--codex-last-user-prompt)
-             (lambda (_path) "say hi")))
-    (let ((session (list :id "abc-123"
-                         :created-at 1772661346
-                         :rollout-path "/tmp/fake.jsonl")))
-      ;; Should contain the prompt text
-      (should (string-match-p "say hi" (claudemacs--codex-format-session-choice session)))
-      ;; Should contain a timestamp
-      (should (string-match-p "^[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}"
-                              (claudemacs--codex-format-session-choice session)))))
-  ;; Test truncation of long messages
-  (cl-letf (((symbol-function 'claudemacs--codex-last-user-prompt)
-             (lambda (_path) (make-string 100 ?x))))
-    (let ((session (list :id "abc-123"
-                         :created-at 1772661346
-                         :rollout-path "/tmp/fake.jsonl")))
-      (should (string-match-p "\\.\\.\\.$" (claudemacs--codex-format-session-choice session)))))
-  ;; Test nil prompt fallback
-  (cl-letf (((symbol-function 'claudemacs--codex-last-user-prompt)
-             (lambda (_path) nil)))
-    (let ((session (list :id "abc-123"
-                         :created-at 1772661346
-                         :rollout-path "/tmp/fake.jsonl")))
-      (should (string-match-p "(no message)" (claudemacs--codex-format-session-choice session))))))
 
 ;;; Terminal Title Tracking Tests
 
